@@ -40,6 +40,7 @@ The agent can read and apply approved non-destructive changes, but it never dele
 - `PUT` and `PATCH` remain available under the signed-in user's Azure RBAC.
 - Destructive recommendations must use `GenerateScript` so the user reviews and runs them.
 - Every session, job, upload, generated artifact, and transcript endpoint must enforce per-user ownership.
+- Ownership of a session is established by comparing its recorded working directory to the caller's own. A filter passed to an SDK list call is a query hint, never the boundary: verify what comes back, drop entries with no recorded directory, and never adopt or resume a session that has not passed that check.
 - Standard add-on consent tiers are read-only. Graph writes require separately granted write scopes.
 - Never log or return bearer tokens, refresh tokens, secrets, authorization headers, or connection strings.
 

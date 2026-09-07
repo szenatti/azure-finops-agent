@@ -508,14 +508,25 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
         // Fast path: user already has a current session id mapped.
         if (_telemetry.CurrentSessionId.TryGetValue(userId, out var currentId))
         {
-            try
+            // A pointer can outlive the identity that created it (anon -> Entra
+            // promotion, disconnect then reconnect as a different account), so it is
+            // not evidence of ownership on its own.
+            if (!await UserOwnsSessionAsync(userId, entraOid, currentId))
             {
-                return await GetOrResumeCoreAsync(userId, currentId, userLogin, entraOid);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Resume failed for {User} session={SessionId}, creating new", userLogin, currentId);
+                _logger.LogWarning("Current session {SessionId} is not owned by user {UserId}; dropping stale pointer", currentId, userId);
                 _telemetry.CurrentSessionId.TryRemove(userId, out _);
+            }
+            else
+            {
+                try
+                {
+                    return await GetOrResumeCoreAsync(userId, currentId, userLogin, entraOid);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Resume failed for {User} session={SessionId}, creating new", userLogin, currentId);
+                    _telemetry.CurrentSessionId.TryRemove(userId, out _);
+                }
             }
         }
 
@@ -525,12 +536,10 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
         {
             try
             {
-                var workdir = GetWorkingDirectory(userId, entraOid);
-                var listed = await _copilotClient.ListSessionsAsync(
-                    new SessionListFilter { WorkingDirectory = workdir }, CancellationToken.None);
-                var mostRecent = listed?
-                    .OrderByDescending(s => s.ModifiedTime)
-                    .FirstOrDefault();
+                // Must go through ListUserSessionsAsync: it re-verifies each result's
+                // working directory, and adopting an unverified "most recent" session
+                // here would also register the caller as its owner in LiveSessions.
+                var mostRecent = (await ListUserSessionsAsync(userId, entraOid)).FirstOrDefault();
                 if (mostRecent is not null)
                 {
                     _telemetry.CurrentSessionId[userId] = mostRecent.SessionId;
@@ -593,6 +602,10 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
     {
         if (_telemetry.LiveSessions.TryGetValue(sessionId, out var live))
         {
+            // The live cache is keyed by session id alone, so it must re-assert the
+            // owner before handing back an in-memory session and its bound tools.
+            if (live.UserId != userId)
+                throw new UnauthorizedAccessException($"Session {sessionId} is live under a different user.");
             // BearerTokenProvider supplies a fresh token per model request, so a
             // cached live session never goes stale on token expiry — no recycle.
             _telemetry.CurrentSessionId[userId] = sessionId;
@@ -635,8 +648,28 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
         // (`/users/{oid}` vs `/anon/{userId}`), so we can safely list either.
         var workdir = GetWorkingDirectory(userId, entraOid);
         var listed = await _copilotClient.ListSessionsAsync(new SessionListFilter { WorkingDirectory = workdir }, ct);
-        return listed?.OrderByDescending(s => s.ModifiedTime).ToList() ?? new List<SessionMetadata>();
+        if (listed is null) return Array.Empty<SessionMetadata>();
+        // The SDK-side filter is a query hint, not the security boundary: it has
+        // been observed returning other users' sessions, which UserOwnsSessionAsync
+        // then accepted. Re-verify each result's recorded workdir locally, exactly
+        // as ListAllManagedSessionsAsync does, and fail closed on anything unknown.
+        var expected = NormalizeWorkdir(workdir);
+        var owned = new List<SessionMetadata>();
+        var rejected = 0;
+        foreach (var s in listed)
+        {
+            if (string.Equals(NormalizeWorkdir(s.Context?.WorkingDirectory), expected, StringComparison.Ordinal))
+                owned.Add(s);
+            else
+                rejected++;
+        }
+        if (rejected > 0)
+            _logger.LogWarning("Session listing for user {UserId} returned {Rejected} session(s) outside the caller's working directory; excluded", userId, rejected);
+        return owned.OrderByDescending(s => s.ModifiedTime).ToList();
     }
+
+    private static string NormalizeWorkdir(string? path) =>
+        (path ?? "").TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 
     /// <summary>
     /// Authoritative ownership check: returns true iff <paramref name="sessionId"/>
@@ -701,6 +734,8 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
         // read off that instance — don't churn a second resume.
         if (_telemetry.LiveSessions.TryGetValue(sessionId, out var live))
         {
+            if (live.UserId != userId)
+                throw new UnauthorizedAccessException($"Session {sessionId} is live under a different user.");
             return await live.Session.GetEventsAsync(ct);
         }
 

@@ -57,6 +57,19 @@ public static class MicrosoftAuthEndpoints
         ctx.Session.Remove("auth_silent");
     }
 
+    private static void DisposeLiveSessionsForUser(AiTelemetry telemetry, long userId)
+    {
+        foreach (var sid in telemetry.LiveSessions.Where(kv => kv.Value.UserId == userId).Select(kv => kv.Key).ToList())
+        {
+            if (!telemetry.LiveSessions.TryRemove(sid, out var live)) continue;
+            telemetry.ActiveSessions.Add(-1);
+            _ = Task.Run(async () =>
+            {
+                try { await live.Session.DisposeAsync(); } catch { }
+            });
+        }
+    }
+
     private static void ClearTierToken(HttpContext ctx, string tier)
     {
         var prefix = tier switch
@@ -560,24 +573,20 @@ public static class MicrosoftAuthEndpoints
                         }
                         if (oldUserId.HasValue && oldUserId.Value != newUserId && !accountSwitched)
                         {
-                            // Anonymous → Entra promotion ONLY. Re-key per-user dicts so the
-                            // current chat doesn't get orphaned mid-conversation. Last-write
-                            // wins is fine: a single user can't be in flight under two ids on
-                            // the same browser session. On an Entra→Entra ACCOUNT SWITCH this
-                            // migration must NOT run — it would hand account A's tokens,
-                            // tools, and active conversation to account B.
-                            // Tool closures capture the token bag, whose UserId also
-                            // determines per-user persistence paths (scores, ledger,
-                            // uploads). Never re-key those closures to another user:
-                            // drop them and let the next request create a fresh bag
-                            // for the stable Entra-derived id.
+                            // Identity changed under this browser session, so every piece of
+                            // in-memory state keyed by the old id is dropped rather than
+                            // re-keyed: tool closures capture a token bag whose UserId also
+                            // selects per-user persistence paths (scores, ledger, uploads),
+                            // and a migrated conversation pointer would survive a
+                            // disconnect/reconnect as a different account. The next prompt
+                            // starts a fresh session under the stable Entra-derived id.
                             if (telemetry.UserTokens.TryRemove(oldUserId.Value, out var oldTokens))
                                 oldTokens.RefreshLock.Dispose();
                             telemetry.UserTools.TryRemove(oldUserId.Value, out _);
-                            if (telemetry.CurrentSessionId.TryRemove(oldUserId.Value, out var sid)) telemetry.CurrentSessionId[newUserId] = sid;
-                            // LiveSessions has init-only UserId; not migrated. Any in-flight CLI
-                            // session under the anon id will be cleaned up by the idle-timeout
-                            // sweep (30 min) and the next prompt creates a fresh one under newUserId.
+                            telemetry.CurrentSessionId.TryRemove(oldUserId.Value, out _);
+                            // The old id's live sessions still hold tools bound to the token bag
+                            // disposed above, so they can neither authenticate nor be re-owned.
+                            DisposeLiveSessionsForUser(telemetry, oldUserId.Value);
                         }
                         ctx.Session.SetString("user", JsonSerializer.Serialize(new
                         {
