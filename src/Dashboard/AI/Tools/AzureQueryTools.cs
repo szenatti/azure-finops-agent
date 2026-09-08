@@ -27,6 +27,7 @@ public class AzureQueryTools
 
     public IEnumerable<AIFunction> Create()
     {
+        yield return AIFunctionFactory.Create(FindSubscriptions, "FindSubscriptions", @"Finds accessible subscriptions by exact name/id, then partial name match, using cached paginated ARM discovery. Use this when a named subscription is not in the connection context. Returns only id, name, state and completeness, at most 50 matches. Duplicate names require clarification. Empty search lists a page; use nextOffset for more. Never use shell tools or GET /subscriptions to resolve names.");
         yield return AIFunctionFactory.Create(QueryAzure, "QueryAzure", @"Queries Azure ARM REST APIs (https://management.azure.com) using the signed-in user's delegated token. Returns raw JSON.
 Methods: GET, PUT, PATCH, plus allowlisted read-only POST endpoints. Mutating action POSTs and DELETE are blocked at the code level. The user's Entra RBAC is the effective access boundary.
 
@@ -40,7 +41,7 @@ Use standard ARM URL conventions; you know the resource providers and current ap
   /providers/Microsoft.Billing/billingAccounts/{billingAccountId}[/billingProfiles/{id}|/invoiceSections/{id}]
 Never bare /providers/Microsoft.CostManagement/... — that returns 400.
 
-COST MANAGEMENT QUERY: use api-version=2026-08-01. ALWAYS group by a real dimension (ServiceName, ResourceGroupName, MeterCategory). Do NOT add 'UsageDate' to the grouping array — it's a response column, not a dimension; use granularity=""Daily"" for per-day. Never request raw ungrouped cost data. For totals across all subscriptions, query the tenant/root management-group scope ONCE and group by SubscriptionName; never fan out one query per subscription.
+COST MANAGEMENT QUERY: use api-version=2026-08-01. ALWAYS group by a real dimension (ServiceName, ResourceGroupName, MeterCategory). Do NOT add 'UsageDate' to the grouping array — it's a response column, not a dimension; use granularity=""Daily"" for per-day. Never request raw ungrouped cost data. For totals across all subscriptions, use QueryCostsAcrossSubscriptions with subscriptionsJson='all'; never fan out one query per subscription. Budget currentSpend is last evaluated spend, NOT live cost and NOT a service breakdown. GET /subscriptions returns a compact page; use FindSubscriptions for name resolution.
 
 THROTTLING: Cost Management /query and /forecast are aggressively throttled per-tenant. Interactive queries make at most one short retry; other transient calls retain the standard retry policy. Do NOT call multiple CostManagement endpoints in parallel from the same turn — Resource Graph and Advisor parallelize fine. If a call still returns HTTP 429, do not make another Cost Management call in the same turn; report the throttle and offer to retry later.
 
@@ -56,9 +57,9 @@ CONSUMPTION DEPRECATIONS: usageDetails → use Microsoft.CostManagement/generate
 
 For public retail pricing use https://prices.azure.com (no auth) with ?$filter=armRegionName eq '...' and serviceName eq '...' and armSkuName eq '...'&$top=20.");
 
-        yield return AIFunctionFactory.Create(QueryCostsAcrossSubscriptions, "QueryCostsAcrossSubscriptions", @"Gets an exact Cost Management total and per-subscription breakdown in ONE agent tool call. Use this for any cost request spanning all connected subscriptions; never loop QueryAzure yourself.
-Input subscriptionsJson: the exact `subscriptions` JSON array supplied in the connection context ({id,name,...}). Input managementGroupId: the optional id/name from the context's managementGroups array. Dates are yyyy-MM-dd; `to` is the exclusive end date.
-    For the current calendar month, the tool first reads each subscription's unfiltered monthly budget `currentSpend` in parallel; this is exact live MTD cost and avoids the heavily throttled query API. For other periods it tries one management-group aggregate query, then the minimum sequential per-subscription fallback. It stops immediately when Cost Management remains throttled and reports completed, failed, and unattempted scopes. Never call this tool twice in one turn after a 429.");
+        yield return AIFunctionFactory.Create(QueryCostsAcrossSubscriptions, "QueryCostsAcrossSubscriptions", @"Gets Cost Management totals, coverage counts and up to 50 subscription details in ONE agent tool call. Use this for any cost request spanning all connected subscriptions; never loop QueryAzure yourself. Cached results may be up to five minutes old and Azure cost ingestion may lag usage.
+Input subscriptionsJson: 'all' for all accessible subscriptions (discovered by the host, never copy a truncated context list), or an explicit JSON array of selected {id,name} scopes. Input managementGroupId: an optional verified containing management group. Dates are yyyy-MM-dd; `to` is the exclusive end date.
+    Uses Cost Management only, never budget evaluations as a live-cost substitute. It tries one supplied management-group aggregate, then at most 20 sequential subscription queries per call. Stops immediately on throttling; reports partial coverage and unattempted scopes, never a complete total for partial data. For larger estates use a supported aggregate scope or Cost Management exports. Never call this tool twice in one turn after a 429.");
 
 
         yield return AIFunctionFactory.Create(BulkAzureRequest, "BulkAzureRequest", @"Executes MANY Azure ARM requests in ONE tool call, in parallel, server-side. Use this whenever you would otherwise loop QueryAzure for the same kind of operation across multiple resources (bulk tagging, cleanup discovery, autoshutdown rollout, budget rollout across subs, multi-resource right-sizing, RBAC fan-out, etc.).
@@ -67,6 +68,18 @@ Optional: parallelism (default 20, max 50), stopOnFirstError (default false).
 Returns ONE compact JSON summary: {""total"":N,""succeeded"":X,""failed"":Y,""durationMs"":Z,""failures"":[{""index"":i,""status"":code,""path"":""..."",""error"":""...""}],""successSamples"":[{""path"":""..."",""name"":""...""}]}.
 DELETE is still blocked at the code level. Same per-request response trimming as QueryAzure (PUT/PATCH echoes are compacted). Throttling-aware: 429 retries are handled per request, batches stay below ARM's 1200 writes/hour/sub.
 Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Build the request list from your prior Resource Graph discovery query in the same turn.");
+    }
+
+    private async Task<string> FindSubscriptions(
+        [Description("Subscription name or id; exact matches are preferred, otherwise partial name matches. Empty lists subscriptions.")] string search = "",
+        [Description("Offset from nextOffset in a previous result, default 0")] string offset = "0")
+    {
+        var token = _tokens.AzureToken;
+        if (string.IsNullOrEmpty(token)) return HttpHelper.TokenMissing("AzureToken", null, "azure.subscriptions");
+        if (!int.TryParse(offset, out var pageOffset) || pageOffset < 0 || pageOffset > 10000)
+            return "HTTP 400 BadRequest\nOffset must be between 0 and 10000.";
+        var discovery = await AzureScopeDiscovery.SubscriptionsAsync(token);
+        return AzureScopeDiscovery.Find(discovery, search, pageOffset);
     }
 
     private async Task<string> QueryAzure(
@@ -107,6 +120,8 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
 
         var (httpMethod, methodError) = HttpHelper.ResolveMethod(method, activity, "azure");
         if (methodError is not null) return methodError;
+        if (httpMethod == HttpMethod.Get && path.Split('?')[0].TrimEnd('/').Equals("/subscriptions", StringComparison.OrdinalIgnoreCase))
+            return await FindSubscriptions();
         if (httpMethod == HttpMethod.Post)
         {
             var postError = ValidateReadOnlyPostPath(path, activity);
@@ -123,7 +138,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
     }
 
     private async Task<string> QueryCostsAcrossSubscriptions(
-        [Description("JSON array of subscription objects from the connection context, each with id and name fields")] string subscriptionsJson,
+        [Description("Use 'all' for all accessible subscriptions, or a JSON array of explicitly selected objects with id and name fields")] string subscriptionsJson,
         [Description("Inclusive start date in yyyy-MM-dd format")] string from,
         [Description("Exclusive end date in yyyy-MM-dd format")] string to,
         [Description("Optional management-group id or full ARM path from the connection context")] string? managementGroupId = null)
@@ -144,13 +159,20 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
         }
 
         var scopes = new List<(string Id, string Name)>();
+        if (subscriptionsJson.Trim().Equals("all", StringComparison.OrdinalIgnoreCase))
+        {
+            var discovery = await AzureScopeDiscovery.SubscriptionsAsync(token);
+            if (!discovery.Complete)
+                return JsonSerializer.Serialize(new { complete = false, source = "scopeDiscovery", detail = discovery.Error });
+            subscriptionsJson = JsonSerializer.Serialize(discovery.Scopes.Select(scope => new { id = scope.Id, name = scope.Name }));
+        }
         try
         {
             using var doc = JsonDocument.Parse(subscriptionsJson);
             if (doc.RootElement.ValueKind != JsonValueKind.Array)
                 return "HTTP 400 BadRequest\nsubscriptionsJson must be a JSON array.";
-            if (doc.RootElement.GetArrayLength() > 500)
-                return "HTTP 400 BadRequest\nsubscriptionsJson supports at most 500 entries; split larger estates into explicit scopes.";
+            if (doc.RootElement.GetArrayLength() > 10000)
+                return "HTTP 400 BadRequest\nsubscriptionsJson supports at most 10000 entries; use a narrower scope.";
 
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var item in doc.RootElement.EnumerateArray())
@@ -179,19 +201,6 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
 
         if (scopes.Count == 0)
             return "HTTP 400 BadRequest\nsubscriptionsJson contained no valid subscription IDs.";
-
-        // The Consumption budgets endpoint returns subscription-level live
-        // `currentSpend` without consuming the Cost Management query QPU pool.
-        // It is valid only for the current calendar month and only when an
-        // unfiltered monthly budget covers the whole subscription. Use this
-        // before /query so an unrelated tenant throttle cannot hide exact MTD.
-        var utcToday = DateOnly.FromDateTime(DateTime.UtcNow);
-        var currentMonthStart = new DateOnly(utcToday.Year, utcToday.Month, 1);
-        if (fromDate == currentMonthStart && toDate == utcToday.AddDays(1))
-        {
-            var budgetSpend = await TryReadCurrentMonthSpendFromBudgets(token, scopes, activity);
-            if (budgetSpend is not null) return budgetSpend;
-        }
 
         var body = JsonSerializer.Serialize(new
         {
@@ -278,6 +287,12 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
         for (var i = 0; i < remainingScopes.Count; i++)
         {
             var scope = remainingScopes[i];
+            if (i >= 20)
+            {
+                resultsById[scope.Id] = new(scope.Id, scope.Name, 0, null, null,
+                    "not attempted: interactive query limit; use an aggregate scope or cost export");
+                continue;
+            }
             var url = $"https://management.azure.com/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/query?api-version=2026-08-01";
             var response = await HttpHelper.SendWithRetryAsync(
                 url, token, activity, "cost.cross_subscription.subscription",
@@ -319,52 +334,6 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
 
         var source = reusedAggregateResults ? "managementGroup+subscriptions" : "subscriptions";
         return BuildCostResponse(source, scopes, resultsById, throttled);
-    }
-
-    private async Task<string?> TryReadCurrentMonthSpendFromBudgets(
-        string token,
-        IReadOnlyList<(string Id, string Name)> scopes,
-        Activity? activity)
-    {
-        var utcToday = DateOnly.FromDateTime(DateTime.UtcNow);
-        var currentMonthStart = new DateOnly(utcToday.Year, utcToday.Month, 1);
-        var tasks = scopes.Select(async scope =>
-        {
-            var response = await HttpHelper.SendWithRetryAsync(
-                $"https://management.azure.com/subscriptions/{scope.Id}/providers/Microsoft.Consumption/budgets?api-version=2024-08-01",
-                token, null, "cost.cross_subscription.budget",
-                bypassCostManagementGate: true,
-                maxAttemptsOverride: 1);
-            return ReadUnfilteredBudgetSpend(scope, response, currentMonthStart, utcToday);
-        });
-        var results = await Task.WhenAll(tasks);
-        if (results.Any(r => !r.Success)) return null;
-
-        var currencies = results
-            .Select(r => r.Currency)
-            .Where(c => !string.IsNullOrWhiteSpace(c))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        if (currencies.Length != 1) return null;
-
-        return JsonSerializer.Serialize(new
-        {
-            complete = true,
-            source = "subscriptionBudgets.currentSpend",
-            period = "currentMonthToDate",
-            subscriptionCount = scopes.Count,
-            totalCost = Math.Round(results.Sum(r => r.Cost), 6),
-            currency = currencies[0],
-            results = results.Select(r => new
-            {
-                subscriptionId = r.SubscriptionId,
-                subscriptionName = r.SubscriptionName,
-                status = 200,
-                cost = Math.Round(r.Cost, 6),
-                currency = r.Currency,
-                budgetName = r.BudgetName
-            })
-        }, new JsonSerializerOptions { WriteIndented = true });
     }
 
     internal static BudgetSpend ReadUnfilteredBudgetSpend(
@@ -474,6 +443,9 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
         {
             using var doc = JsonDocument.Parse(ResponseBody(response));
             var props = doc.RootElement.GetProperty("properties");
+            if (props.TryGetProperty("nextLink", out var continuation) && !string.IsNullOrWhiteSpace(continuation.GetString()))
+                return new(new Dictionary<string, CostScopeResult>(StringComparer.OrdinalIgnoreCase),
+                    "Aggregate cost response is paginated; this page alone is not a complete total.");
             var columns = props.GetProperty("columns").EnumerateArray()
                 .Select((c, i) => (Name: c.GetProperty("name").GetString() ?? "", Index: i))
                 .ToDictionary(x => x.Name, x => x.Index, StringComparer.OrdinalIgnoreCase);
@@ -563,12 +535,17 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
             throttled,
             subscriptionCount = scopes.Count,
             succeeded,
+            failed = orderedResults.Count(result => result.Status != 0 && (result.Status != 200 || result.Cost is null)),
+            unattempted = orderedResults.Count(result => result.Status == 0),
+            resultsTruncated = orderedResults.Count > 50,
+            freshness = "Cost Management queries may be cached for five minutes; upstream cost ingestion may lag usage.",
             mixedCurrencies = totalsByCurrency.Count > 1,
             totalCost = complete && safeAggregate ? Math.Round(summedCost!.Value, 6) : (double?)null,
             partialCost = !complete && safeAggregate && succeeded > 0 ? Math.Round(summedCost!.Value, 6) : (double?)null,
             currency = singleCurrency,
             totalsByCurrency,
-            results = orderedResults.Select(r => new
+            results = orderedResults.OrderBy(result => result.Status == 200 && result.Cost is not null ? 0 : result.Status != 0 ? 1 : 2)
+                .ThenByDescending(result => result.Cost ?? 0).Take(50).Select(r => new
             {
                 subscriptionId = r.SubscriptionId,
                 subscriptionName = r.SubscriptionName,
@@ -589,6 +566,11 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
         {
             using var doc = JsonDocument.Parse(ResponseBody(response));
             var props = doc.RootElement.GetProperty("properties");
+            if (props.TryGetProperty("nextLink", out var continuation) && !string.IsNullOrWhiteSpace(continuation.GetString()))
+            {
+                error = "Cost response is paginated; this page alone is not a complete total.";
+                return false;
+            }
             var columns = props.GetProperty("columns").EnumerateArray()
                 .Select((c, i) => (Name: c.GetProperty("name").GetString() ?? "", Index: i))
                 .ToDictionary(x => x.Name, x => x.Index, StringComparer.OrdinalIgnoreCase);

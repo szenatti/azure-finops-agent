@@ -29,6 +29,7 @@
   <!-- Embed Python script templates as resources (loaded at runtime by tools) -->
   <ItemGroup>
     <EmbeddedResource Include="AI\Tools\Resources\*.py" />
+    <InternalsVisibleTo Include="LargeTenant.RegressionTests" />
   </ItemGroup>
 
 </Project>

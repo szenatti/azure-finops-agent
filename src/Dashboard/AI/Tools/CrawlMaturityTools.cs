@@ -26,7 +26,7 @@ public sealed class CrawlMaturityTools
 
     public IEnumerable<AIFunction> Create()
     {
-        yield return AIFunctionFactory.Create(GetCrawlMaturityEvidence, "GetCrawlMaturityEvidence", @"Collects, scores, and persists all seven Crawl maturity dimensions in ONE tool call: budgets/current spend, exact CostCenter/Owner/Environment tagging, exports, alerts/scheduled actions, policy guardrails, common waste, and cost visibility. It also returns ready-to-render fix actions. Low-cost metadata reads run with bounded server-side concurrency; no Cost Management /query is needed because budget currentSpend provides exact MTD spend.
+        yield return AIFunctionFactory.Create(GetCrawlMaturityEvidence, "GetCrawlMaturityEvidence", @"Collects, scores, and persists all seven Crawl maturity dimensions in ONE tool call: budgets/last evaluated spend, exact CostCenter/Owner/Environment tagging, exports, alerts/scheduled actions, policy guardrails, common waste, and cost visibility. It also returns ready-to-render fix actions. Low-cost metadata reads run with bounded server-side concurrency. Budget currentSpend is the last budget evaluation, not live Cost Analysis data; report it only as last evaluated spend with coverage, never as an authoritative live MTD total.
     Use exactly once for Crawl/FinOps maturity scoring. Pass the exact `subscriptions` array and optional first management-group id from the connection context. Do NOT supplement it with QueryAzure, ReportMaturityScore, SuggestFollowUp, or any other tool—the score persistence, maturity SSE event, and follow-up buttons are already handled by this result.");
     }
 
@@ -111,6 +111,7 @@ public sealed class CrawlMaturityTools
                 subscriptionsWithBudgets = budgets.Count(b => b.BudgetCount > 0),
                 totalBudgets = budgets.Sum(b => b.BudgetCount),
                 mtdCurrentSpend = mtdFromBudgets is null ? (double?)null : Math.Round(mtdFromBudgets.Value, 2),
+                spendFreshness = "Last budget evaluation; not live Cost Analysis. Evaluation timestamp unavailable.",
                 spendComplete,
                 subscriptionsWithValidatedSpend,
                 currency = currencies.Length == 1 ? currencies[0] : null,
@@ -130,6 +131,7 @@ public sealed class CrawlMaturityTools
             visibility = new
             {
                 mtdSource = "Microsoft.Consumption budgets currentSpend",
+                spendFreshness = "Last budget evaluation; not live Cost Analysis. Evaluation timestamp unavailable.",
                 mtdCurrentSpend = mtdFromBudgets is null ? (double?)null : Math.Round(mtdFromBudgets.Value, 2),
                 spendComplete,
                 currency = currencies.Length == 1 ? currencies[0] : null,
@@ -584,7 +586,7 @@ public sealed class CrawlMaturityTools
             new("waste", "Waste identification & cleanup", wasteScore,
                 $"{totalWaste} waste items were found: {commonWaste} unattached disks/orphaned IPs/empty paid App Service plans plus {emptyGroups} empty resource groups ({emptyGroupSpread})."),
             new("visibility", "Cost visibility & ownership", visibilityScore,
-                $"Budget currentSpend provides {spendSummary} across {visibleSubscriptions}/{subscriptions.Count} subscriptions ({spendSpread}); governed ownership-tag coverage is {Math.Round(tagCoverage, 1)}% across {totalResources} resources.")
+                $"Last budget evaluation (not live Cost Analysis) provides {spendSummary} across {visibleSubscriptions}/{subscriptions.Count} subscriptions ({spendSpread}); governed ownership-tag coverage is {Math.Round(tagCoverage, 1)}% across {totalResources} resources.")
         ];
     }
 

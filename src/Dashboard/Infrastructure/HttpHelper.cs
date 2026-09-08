@@ -1,7 +1,9 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace AzureFinOps.Dashboard.Infrastructure;
 
@@ -16,6 +18,7 @@ public static class HttpHelper
     // matches the factory defaults wired up in Program.cs.
     private static readonly HttpClient Http = new(Ipv4HttpHandler.Create())
     { Timeout = TimeSpan.FromSeconds(60) };
+    private static readonly MemoryCache CostResponses = new(new MemoryCacheOptions { SizeLimit = 8 * 1024 * 1024 });
 
     public static readonly ActivitySource Telemetry = new("AzureFinOps.AI");
 
@@ -68,17 +71,9 @@ public static class HttpHelper
     private const int MaxThrottleRetries = 5;
     private const int MaxInteractiveCostAttempts = 2;
 
-    // Cap on a single wait between retries (seconds). Honors Retry-After up to this ceiling
-    // so a misbehaving service can't pin us indefinitely. Cost Management commonly returns
-    // 30–60s; bigger waits are clamped to keep tool latency bounded.
     private const int MaxRetryWaitSeconds = 60;
+    private const int MaxInteractiveRetryWaitSeconds = 5;
 
-    // Cost Management / Consumption / Billing share an aggressive per-tenant throttle pool.
-    // App Insights showed 87/89 (97.8%) of /query calls returning 429 inside a single 34s burst
-    // — the LLM (esp. via BulkAzureRequest with parallelism=20) was fan-firing parallel queries
-    // that all collided. This semaphore globally serializes those calls to a small concurrency,
-    // turning a retry storm into ordered execution. Other ARM/Graph/LogAnalytics calls are
-    // unaffected and still parallelize freely.
     private static readonly SemaphoreSlim CostMgmtGate = new(2, 2);
     private const int CostMgmtQueueNotifyMs = 250;
 
@@ -93,13 +88,27 @@ public static class HttpHelper
         || url.Contains("/Microsoft.CostManagement/forecast", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Sends an HTTP request with silent retry on 429 (up to 5 attempts). On each 429 we honor,
-    /// in priority order: Cost Management's <c>x-ms-ratelimit-microsoft.costmanagement-qpu-retry-after</c>,
-    /// then the standard <c>Retry-After</c> header (delta or HTTP-date), then exponential backoff
-    /// with jitter. After 5 failed attempts the 429 response is returned to the caller.
+    /// Retries transient failures within a bounded wait budget, respecting all server retry hints.
+    /// Query/forecast calls share tenant pacing and cooldown across users and turns in this process.
     /// Returns formatted "HTTP {status}\n{body}" string for the LLM.
     /// </summary>
-    public static async Task<string> SendWithRetryAsync(
+    public static Task<string> SendWithRetryAsync(
+        string url,
+        string token,
+        Activity? activity,
+        string telemetryPrefix,
+        HttpMethod? method = null,
+        string? jsonBody = null,
+        bool includeTimestamp = false,
+        Dictionary<string, string>? extraHeaders = null,
+        int? maxResponseChars = null,
+        bool bypassCostManagementGate = false,
+        int? maxAttemptsOverride = null)
+        => SendCoreAsync(Http, url, token, activity, telemetryPrefix, method, jsonBody, includeTimestamp,
+            extraHeaders, maxResponseChars, bypassCostManagementGate, maxAttemptsOverride);
+
+    internal static async Task<string> SendCoreAsync(
+        HttpClient http,
         string url,
         string token,
         Activity? activity,
@@ -117,6 +126,7 @@ public static class HttpHelper
         var totalSw = Stopwatch.StartNew();
         var totalWaitSec = 0.0;
         var retryCount = 0;
+        var finalRetrySeconds = 0.0;
         HttpResponseMessage res = null!;
 
         // Resolve the per-turn SSE reporter ONCE up front — used for queue waits,
@@ -128,13 +138,12 @@ public static class HttpHelper
         // user; user-level routing can inject a job's retry details into the
         // wrong conversation. Missing baggage means no SSE status event.
 
-        // Gate Cost Management / Consumption / Billing calls behind a small global
-        // semaphore (2 concurrent). Without this, the LLM (esp. via BulkAzureRequest
-        // parallelism=20) fan-fires parallel /query calls that all collide on the
-        // per-tenant throttle. While queued we emit cooling_down so the UI shows
-        // "waiting in queue" instead of a frozen tool row. The opt-out is ONLY
-        // valid for read-only metadata GETs issued by bounded aggregate tools;
-        // it can never bypass query/forecast serialization or method security.
+        var costQuery = IsInteractiveCostQueryUrl(url) ? CostQueryCoordinator.ForToken(token) : null;
+        var cacheKey = costQuery is not null && method == HttpMethod.Post && extraHeaders is null && maxResponseChars is null
+            ? Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+                System.Text.Json.JsonSerializer.Serialize(new { token, url, jsonBody, includeTimestamp }))))
+            : null;
+        var gate = costQuery?.Gate ?? CostMgmtGate;
         var safeMetadataBypass = bypassCostManagementGate
             && method == HttpMethod.Get
             && !IsInteractiveCostQueryUrl(url);
@@ -142,12 +151,12 @@ public static class HttpHelper
         var heldGate = false;
         if (isCostMgmt)
         {
-            if (!await CostMgmtGate.WaitAsync(CostMgmtQueueNotifyMs))
+            if (!await gate.WaitAsync(CostMgmtQueueNotifyMs))
             {
                 // Couldn't grab the gate immediately — surface a queue-wait event
                 // and keep retrying every ~3s so the ghost row stays alive in the UI.
                 var queuedSw = Stopwatch.StartNew();
-                while (!await CostMgmtGate.WaitAsync(3000))
+                while (!await gate.WaitAsync(3000))
                 {
                     Logger?.LogInformation("HTTP queued {Tool} waitedSec={Wait:F1} url={Url}",
                         telemetryPrefix, queuedSw.Elapsed.TotalSeconds, url);
@@ -170,6 +179,20 @@ public static class HttpHelper
 
         try
         {
+            if (cacheKey is not null && CostResponses.TryGetValue(cacheKey, out string? cachedResponse))
+            {
+                activity?.SetTag($"{telemetryPrefix}.result", "cache_hit");
+                activity?.SetTag($"{telemetryPrefix}.status_code", 200);
+                return cachedResponse!;
+            }
+            if (costQuery?.RetryAfterSeconds is > 0)
+            {
+                activity?.SetTag($"{telemetryPrefix}.result", "tenant_cooldown");
+                activity?.SetTag($"{telemetryPrefix}.status_code", 429);
+                activity?.SetStatus(ActivityStatusCode.Error, "Tenant cost query cooldown");
+                return $"HTTP 429 TooManyRequests\nRetry-After: {Math.Ceiling(costQuery.RetryAfterSeconds):F0} seconds.\n"
+                    + "{\"error\":{\"code\":\"TenantCostCooldown\",\"message\":\"No Azure request was sent. A previous query was throttled; retry after the cooldown.\"}}";
+            }
             var maxAttempts = Math.Clamp(
                 maxAttemptsOverride ?? (IsInteractiveCostQueryUrl(url)
                     ? MaxInteractiveCostAttempts
@@ -178,6 +201,11 @@ public static class HttpHelper
                 MaxThrottleRetries);
             for (var attempt = 0; attempt < maxAttempts; attempt++)
             {
+                if (costQuery is not null)
+                {
+                    await Task.Delay(costQuery.PacingDelay);
+                    costQuery.RecordRequest();
+                }
                 using var req = new HttpRequestMessage(method, url);
                 req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
                 req.Headers.Add("User-Agent", "FinOps-Dashboard/1.0");
@@ -211,7 +239,7 @@ public static class HttpHelper
 
                 try
                 {
-                    res = await Http.SendAsync(req);
+                    res = await http.SendAsync(req);
                 }
                 finally
                 {
@@ -225,9 +253,21 @@ public static class HttpHelper
                 var isThrottle = status == 429;
                 var isTransientServer = status == 502 || status == 503 || status == 504;
                 if (!isThrottle && !isTransientServer) break;
-                if (attempt == maxAttempts - 1) break; // last attempt — return as-is to caller
 
                 var waitSeconds = ResolveRetryAfterSeconds(res, attempt);
+                finalRetrySeconds = waitSeconds;
+                if (isThrottle)
+                {
+                    costQuery?.RecordThrottle(waitSeconds);
+                    activity?.SetTag($"{telemetryPrefix}.retry_after_sec", waitSeconds);
+                    if (res.Headers.TryGetValues("x-ms-request-id", out var requestIds))
+                        activity?.SetTag($"{telemetryPrefix}.request_id", requestIds.FirstOrDefault());
+                }
+                if (attempt == maxAttempts - 1) break;
+                var waitBudget = IsInteractiveCostQueryUrl(url)
+                    ? MaxInteractiveRetryWaitSeconds
+                    : MaxRetryWaitSeconds;
+                if (waitSeconds > waitBudget) break;
                 totalWaitSec += waitSeconds;
                 retryCount++;
                 var reason = isThrottle ? "429" : status.ToString();
@@ -254,14 +294,16 @@ public static class HttpHelper
                     Logger?.LogWarning("SSE cooling_down skipped — no reporter for turn={Turn} (tool={Tool})",
                         turnKey ?? "<none>", telemetryPrefix);
                 }
+                res.Dispose();
                 await Task.Delay(TimeSpan.FromSeconds(waitSeconds));
             }
         }
         finally
         {
-            if (heldGate) CostMgmtGate.Release();
+            if (heldGate) gate.Release();
         }
 
+        using var finalResponse = res;
         var responseBody = await res.Content.ReadAsStringAsync();
         totalSw.Stop();
 
@@ -285,9 +327,14 @@ public static class HttpHelper
         if (!res.IsSuccessStatusCode)
             activity?.SetStatus(ActivityStatusCode.Error, $"HTTP {(int)res.StatusCode}");
 
-        var result = $"HTTP {(int)res.StatusCode} {res.StatusCode}\n";
-        if (includeTimestamp)
+        var result = $"HTTP {(int)res.StatusCode} {res.StatusCode}";
+        if (cacheKey is not null && res.IsSuccessStatusCode)
+            result += $"; Cost data fetched at UTC {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}; may be reused for up to 5 minutes. Azure cost ingestion may lag usage.";
+        result += "\n";
+        if (includeTimestamp && cacheKey is null)
             result += $"Current UTC time: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}\n";
+        if ((int)res.StatusCode == 429)
+            result += $"Retry-After: {Math.Ceiling(finalRetrySeconds):F0} seconds. Do not retry before this delay.\n";
 
         // Trim chatty PUT/PATCH echoes — ARM returns the full resource (often 5–20KB) on success.
         // For bulk mutations this dominates LLM input tokens with no informational value.
@@ -327,34 +374,39 @@ public static class HttpHelper
             result += responseBody;
         }
 
+        if (cacheKey is not null && res.StatusCode == System.Net.HttpStatusCode.OK && result.Length <= 256 * 1024)
+            CostResponses.Set(cacheKey, result, new MemoryCacheEntryOptions
+            {
+                Size = Encoding.UTF8.GetByteCount(result),
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5)
+            });
         return result;
     }
 
     /// <summary>
-    /// Resolves how long to wait before the next retry on a 429 response. Priority:
-    /// (1) Cost Management's QPU-specific header, (2) standard Retry-After (delta or HTTP-date),
-    /// (3) exponential backoff with jitter (2s, 4s, 8s, 16s...). Result is clamped to
-    /// [1, MaxRetryWaitSeconds].
+    /// Returns the longest server retry delay without shortening it, or exponential backoff.
     /// </summary>
     private static double ResolveRetryAfterSeconds(HttpResponseMessage res, int attempt)
     {
-        // Cost Management exposes a service-specific retry header — prefer it when present.
-        if (res.Headers.TryGetValues("x-ms-ratelimit-microsoft.costmanagement-qpu-retry-after", out var qpuValues)
-            && double.TryParse(qpuValues.FirstOrDefault(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var qpuSeconds)
-            && qpuSeconds > 0)
-        {
-            return Math.Min(Math.Max(qpuSeconds, 1), MaxRetryWaitSeconds);
-        }
-
-        // Standard Retry-After (seconds) or HTTP-date.
         var standard = res.Headers.RetryAfter?.Delta?.TotalSeconds
                     ?? res.Headers.RetryAfter?.Date?.Subtract(DateTimeOffset.UtcNow).TotalSeconds;
-        if (standard is > 0)
+        var delay = standard is > 0 ? standard.Value : 0;
+        foreach (var header in res.Headers)
         {
-            return Math.Min(Math.Max(standard.Value, 1), MaxRetryWaitSeconds);
+            if (!header.Key.Equals("x-ms-ratelimit-microsoft.consumption-retry-after", StringComparison.OrdinalIgnoreCase)
+                && !(header.Key.StartsWith("x-ms-ratelimit-microsoft.costmanagement-", StringComparison.OrdinalIgnoreCase)
+                    && header.Key.EndsWith("-retry-after", StringComparison.OrdinalIgnoreCase)))
+                continue;
+            foreach (var value in header.Value)
+            {
+                if (double.TryParse(value, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var seconds)
+                    && double.IsFinite(seconds) && seconds > 0)
+                    delay = Math.Max(delay, seconds);
+            }
         }
+        if (delay > 0) return Math.Max(1, delay);
 
-        // Fallback: exponential backoff with small jitter to avoid lockstep retries.
         var backoff = Math.Pow(2, attempt + 1); // 2, 4, 8, 16, 32
         var jitter = Random.Shared.NextDouble(); // 0..1s
         return Math.Min(backoff + jitter, MaxRetryWaitSeconds);

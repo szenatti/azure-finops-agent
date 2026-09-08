@@ -1,5 +1,6 @@
 using System.Net.Http.Headers;
 using System.Text.Json;
+using AzureFinOps.Dashboard.Infrastructure;
 using AzureFinOps.Dashboard.Observability;
 
 namespace AzureFinOps.Dashboard.Auth;
@@ -75,60 +76,19 @@ public static class AzureSessionEndpoints
                 }
             }
 
-            var http = httpFactory.CreateClient();
-            var subscriptions = new List<object>();
-            try
+            var subscriptionsTask = AzureScopeDiscovery.SubscriptionsAsync(token);
+            var groupsTask = AzureScopeDiscovery.ManagementGroupsAsync(token);
+            await Task.WhenAll(subscriptionsTask, groupsTask);
+            var subscriptionDiscovery = await subscriptionsTask;
+            var groupDiscovery = await groupsTask;
+            var subscriptions = subscriptionDiscovery.Scopes.Select(scope => new
             {
-                using var subReq = new HttpRequestMessage(HttpMethod.Get, "https://management.azure.com/subscriptions?api-version=2022-12-01");
-                subReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                subReq.Headers.Add("User-Agent", "FinOps-Dashboard/1.0");
-                var subRes = await http.SendAsync(subReq);
-                var subBody = await subRes.Content.ReadAsStringAsync();
-                var subJson = JsonSerializer.Deserialize<JsonElement>(subBody);
-                if (subJson.TryGetProperty("value", out var subs))
-                {
-                    foreach (var sub in subs.EnumerateArray())
-                    {
-                        subscriptions.Add(new
-                        {
-                            id = sub.GetProperty("subscriptionId").GetString(),
-                            name = sub.GetProperty("displayName").GetString(),
-                            state = sub.GetProperty("state").GetString(),
-                            tenantId = sub.TryGetProperty("tenantId", out var tid) ? tid.GetString() : null
-                        });
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning(ex, "Failed to list Azure subscriptions");
-            }
-
-            var managementGroups = new List<object>();
-            try
-            {
-                using var mgReq = new HttpRequestMessage(HttpMethod.Get, "https://management.azure.com/providers/Microsoft.Management/managementGroups?api-version=2021-04-01");
-                mgReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                mgReq.Headers.Add("User-Agent", "FinOps-Dashboard/1.0");
-                var mgRes = await http.SendAsync(mgReq);
-                var mgBody = await mgRes.Content.ReadAsStringAsync();
-                var mgJson = JsonSerializer.Deserialize<JsonElement>(mgBody);
-                if (mgJson.TryGetProperty("value", out var mgs))
-                {
-                    foreach (var mg in mgs.EnumerateArray())
-                    {
-                        managementGroups.Add(new
-                        {
-                            id = mg.GetProperty("id").GetString(),
-                            name = mg.TryGetProperty("properties", out var props) && props.TryGetProperty("displayName", out var dn) ? dn.GetString() : mg.GetProperty("name").GetString()
-                        });
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning(ex, "Failed to list management groups");
-            }
+                id = scope.Id, name = scope.Name, state = scope.State, tenantId = scope.TenantId
+            }).ToArray();
+            var managementGroups = groupDiscovery.Scopes.Select(scope => new { id = scope.Id, name = scope.Name }).ToArray();
+            if (!subscriptionDiscovery.Complete || !groupDiscovery.Complete)
+                logger.LogWarning("Azure scope discovery incomplete: subscriptions={SubscriptionsComplete} managementGroups={GroupsComplete}",
+                    subscriptionDiscovery.Complete, groupDiscovery.Complete);
 
             var connectedApis = new List<string>
             {
@@ -153,11 +113,14 @@ public static class AzureSessionEndpoints
             {
                 ownerObjectId = scopeOwnerOid,
                 ownerTenantId = scopeTenantId,
-                subscriptionCount = subscriptions.Count,
+                subscriptionCount = subscriptions.Length,
                 subscriptions = subscriptions.Take(500),
-                subscriptionsTruncated = subscriptions.Count > 500,
+                subscriptionsComplete = subscriptionDiscovery.Complete,
+                subscriptionsError = subscriptionDiscovery.Error,
+                subscriptionsTruncated = !subscriptionDiscovery.Complete || subscriptions.Length > 500,
                 managementGroups = managementGroups.Take(50),
-                managementGroupsTruncated = managementGroups.Count > 50
+                managementGroupsComplete = groupDiscovery.Complete,
+                managementGroupsTruncated = !groupDiscovery.Complete || managementGroups.Length > 50
             }));
 
             return Results.Json(new
@@ -166,6 +129,10 @@ public static class AzureSessionEndpoints
                 user = azureUser,
                 subscriptions,
                 managementGroups,
+                subscriptionsComplete = subscriptionDiscovery.Complete,
+                subscriptionsError = subscriptionDiscovery.Error,
+                managementGroupsComplete = groupDiscovery.Complete,
+                managementGroupsError = groupDiscovery.Error,
                 apis = connectedApis,
                 graphEnabled = ctx.Session.GetString("graph_token") is not null,
                 graphTier = ctx.Session.GetString("graph_tier") ?? "",

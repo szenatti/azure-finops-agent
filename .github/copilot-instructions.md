@@ -1,4 +1,4 @@
-<!-- last refreshed: 2026-09-02 -->
+<!-- last refreshed: 2026-09-08 -->
 
 # Azure FinOps Agent — Copilot Instructions
 
@@ -87,14 +87,19 @@ Before manually testing a fresh consent flow, revoke existing grants for the tes
 - Push aggregation, filtering, grouping, and limits into the source API.
 - Parallelize independent calls, except Cost Management `/query` and `/forecast`, which are tenant-throttled.
 - Never issue multiple Cost Management query calls in parallel. After a final 429, stop querying that service for the turn.
+- Cost query/forecast requests share a tenant-keyed semaphore, one-second spacing, and cooldown across users, turns, and scheduled jobs in the same process. Tenant claims are used only for throttle bucketing, never authorization. Honor the longest positive standard or Cost Management/Consumption retry hint; return long cooldowns instead of shortening them. Multi-instance hosting needs distributed rate/cooldown coordination.
+- Successful cost-query responses are cached for five minutes under hashed caller-token + request keys, never across principals. Preserve fetch-time guidance and the HTTP-status-line + JSON-body contract.
+- Scope discovery follows subscription and management-group pages with same-host/path HTTPS continuation validation, a five-minute caller-token-isolated cache, and explicit incomplete flags. Use `FindSubscriptions` for bounded name/id resolution, never shell parsing of ARM inventory. Cache/prompt bounds are not proof that all scopes were discovered.
 
 ### Cross-subscription cost
 
 Use `QueryCostsAcrossSubscriptions` exactly once for all-subscription totals.
 
-- For the current calendar month, it reads unfiltered monthly-budget `currentSpend` concurrently. Strict guards require current-month dates, monthly Cost budgets, empty filters, agreeing duplicate budgets, and one currency.
-- For other periods, it tries one management-group aggregate query and then the minimum sequential subscription fallback.
-- Do not list subscriptions again; connection status already provides the available scopes.
+- Pass `subscriptionsJson='all'` to resolve all accessible scopes server-side; explicit arrays select a subset. Never treat a truncated connection-context array as the entire estate.
+- It tries one supplied, verified containing management-group query, then at most 20 sequential subscription queries. Larger estates need a supported aggregate scope or Cost Management exports. Paginated cost responses cannot be accepted as complete totals.
+- Results preserve complete/failed/unattempted counts with at most 50 detail rows. Partial data never produces a complete estate total.
+- Budget `currentSpend` is the last evaluated cost, not live Cost Analysis data and not a service breakdown. Never substitute it for authoritative costs; empty budgets do not mean zero spend.
+- Do not list subscriptions again; reuse connection metadata or the host discovery cache.
 
 ### Crawl maturity
 
@@ -102,6 +107,7 @@ Use `GetCrawlMaturityEvidence` exactly once for explicit Crawl scoring.
 
 - It runs budget/current-spend, required-tag, exports, alert/scheduled-action, policy, common-waste, and empty-resource-group checks concurrently.
 - It computes and persists all seven scores and returns follow-up actions.
+- Budget-based spend evidence is explicitly labeled last evaluated, with coverage and unknown evaluation time; it is not live MTD cost.
 - `ChatEndpoints` emits `maturity_score` and `follow_up` directly.
 - Do not call `QueryAzure`, `FindIdleResources`, `ReportMaturityScore`, or `SuggestFollowUp` in the same Crawl turn.
 - Walk, Run, and Playbook continue to use `ReportMaturityScore`.
@@ -175,6 +181,7 @@ The frontend must be built before backend startup so `wwwroot` exists when ASP.N
 ## Testing
 
 - Backend: `dotnet build src/Dashboard/Dashboard.csproj --no-restore`
+- Large-tenant regression checks (no Azure calls): `dotnet run --project tests/LargeTenant.RegressionTests -p:CopilotSkipCliDownload=true`. Uses the actual Dashboard assembly with fake HTTP responses; covers retries, cooldown/pacing, caching isolation, pagination, compact lookup, and incomplete cost results.
 - Frontend: `npm run build` under `src/Dashboard/frontend`
 - Always verify the rendered UI for UI changes; a successful build is not a browser test.
 - Measure latency from the app's SSE stream, not rendered pixels.
