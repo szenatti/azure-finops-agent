@@ -109,6 +109,28 @@ var throttledResult = await HttpHelper.SendCoreAsync(throttledHttp, costUrl, thr
 Check(throttledCalls == 1 && throttledResult.Contains("Retry-After: 120"), "Long cooldown returns immediately without early retry");
 var subsequent = await HttpHelper.SendCoreAsync(throttledHttp, costUrl, throttledToken, null, "test", HttpMethod.Post);
 Check(throttledCalls == 1 && subsequent.Contains("TenantCostCooldown"), "Real 429 blocks subsequent turns");
+using (var response = JsonDocument.Parse(throttledResult[(throttledResult.IndexOf('\n') + 1)..]))
+{
+    var retry = response.RootElement.GetProperty("finopsRetry");
+    Check(retry.GetProperty("retryAfterSeconds").GetDouble() == 120 && retry.GetProperty("source").GetString() == "azure"
+        && retry.GetProperty("delaySource").GetString() == "server", "Server cooldown is visible in JSON-rendered tool output");
+}
+using (var response = JsonDocument.Parse(subsequent[(subsequent.IndexOf('\n') + 1)..]))
+    Check(response.RootElement.GetProperty("finopsRetry").GetProperty("source").GetString() == "localCooldown",
+        "Execution output distinguishes a local cooldown from an Azure rejection");
+var headerlessCalls = 0;
+using (var headerlessHttp = new HttpClient(new StubHandler(_ =>
+{
+    headerlessCalls++;
+    return new HttpResponseMessage(HttpStatusCode.TooManyRequests) { Content = new StringContent("{\"error\":{\"code\":\"429\"}}") };
+})))
+{
+    var response = await HttpHelper.SendCoreAsync(headerlessHttp, costUrl, Token(Guid.NewGuid(), "no-header"), null, "test", HttpMethod.Post);
+    using var json = JsonDocument.Parse(response[(response.IndexOf('\n') + 1)..]);
+    var retry = json.RootElement.GetProperty("finopsRetry");
+    Check(headerlessCalls == 1 && retry.GetProperty("retryAfterSeconds").GetDouble() == 60
+        && retry.GetProperty("delaySource").GetString() == "fallback", "Headerless 429 uses an explicit conservative fallback without a rapid retry");
+}
 
 var cachedCalls = 0;
 using var costHttp = new HttpClient(new StubHandler(_ =>
@@ -174,6 +196,122 @@ Check(typeof(AzureQueryTools).GetMethod("TryReadCurrentMonthSpendFromBudgets", B
 var parseCost = typeof(AzureQueryTools).GetMethod("TryReadCost", BindingFlags.Static | BindingFlags.NonPublic)!;
 object?[] parseArguments = ["HTTP 200 OK\n" + JsonSerializer.Serialize(new { properties = new { nextLink = "https://management.azure.com/next" } }), 0d, null, null];
 Check(!(bool)parseCost.Invoke(null, parseArguments)!, "Unfinished cost page cannot become a total");
+var crawlScopes = Enumerable.Range(0, 227).Select(index => new CrawlMaturityTools.SubscriptionScope(
+    Guid.NewGuid().ToString(), "Example-subscription-" + index + new string('x', 150))).ToArray();
+var crawlBudgets = crawlScopes.Select(scope => new CrawlMaturityTools.BudgetEvidence(
+    scope.Id, scope.Name, 200, 1, 100, 12, "AUD", 1, 1, null)).ToArray();
+var crawlCollections = crawlScopes.Select(scope => new CrawlMaturityTools.CollectionEvidence(
+    scope.Id, scope.Name, 200, 8, Enumerable.Repeat(new string('y', 250), 10).ToArray(), null)).ToArray();
+var crawlTags = new { status = 200, data = crawlScopes.Select(scope => new
+    { subscriptionId = scope.Id, total = 200, fullyTagged = 1, costCenter = 1, owner = 1, environment = 1 }).ToArray() };
+var crawlPolicy = new { status = 200, data = crawlScopes.Select(scope => new
+    { subscriptionId = scope.Id, totalAssignments = 5, finOpsAssignments = 1 }).ToArray() };
+var crawlWaste = new { status = 200, data = crawlScopes.Select(scope => new
+    { subscriptionId = scope.Id, wasteCount = 2, names = Enumerable.Repeat(new string('z', 250), 10).ToArray() }).ToArray() };
+var crawlEmpty = new { status = 200, data = crawlScopes.Select(scope => new
+    { subscriptionId = scope.Id, emptyGroupCount = 3, names = Enumerable.Repeat(new string('z', 250), 10).ToArray() }).ToArray() };
+var crawlTotals = new Dictionary<string, double> { ["AUD"] = 227 * 12 };
+var crawlScores = CrawlMaturityTools.BuildScores(crawlScopes, crawlBudgets, crawlTags, crawlCollections,
+    crawlCollections, crawlCollections, crawlPolicy, crawlWaste, crawlEmpty, 227 * 12, "AUD", crawlTotals);
+var crawlEvidence = new
+{
+    generatedUtc = "2026-09-08T00:00:00Z", subscriptionCount = 227, subscriptions = crawlScopes,
+    budgets = new { totalBudgets = 227, spendComplete = true, totalsByCurrency = crawlTotals, details = crawlBudgets },
+    visibility = new { subscriptionsWithValidatedSpend = 227, totalsByCurrency = crawlTotals },
+    tagging = crawlTags, policy = crawlPolicy, exports = crawlCollections, scheduledActions = crawlCollections,
+    alerts = crawlCollections, waste = new { commonPatterns = crawlWaste, emptyResourceGroups = crawlEmpty }
+};
+var compactCrawl = JsonSerializer.Serialize(new { kind = "crawl_maturity_result", scores = crawlScores,
+    followUp = new { label = "Review evidence", prompt = "Review evidence" },
+    evidence = CrawlMaturityTools.SummarizeEvidence(crawlEvidence) });
+Check(Encoding.UTF8.GetByteCount(compactCrawl) < 24000, "227-subscription Crawl result stays below 24KB");
+Check(crawlScores.Count == 7 && crawlScores.All(score => score.Detail.Length < 1000), "All seven Crawl score explanations stay bounded");
+using (var compactDoc = JsonDocument.Parse(compactCrawl))
+{
+    var evidence = compactDoc.RootElement.GetProperty("evidence");
+    Check(evidence.GetProperty("tagging").GetProperty("totals").GetProperty("total").GetDouble() == 45400,
+        "Compact Crawl preserves estate-wide numeric evidence");
+    Check(evidence.GetProperty("exports").GetProperty("itemCount").GetInt32() == 1816,
+        "Compact Crawl preserves full collection counts");
+    Check(evidence.GetProperty("waste").GetProperty("commonPatterns").GetProperty("samples").GetArrayLength() == 3,
+        "Crawl resource samples are bounded");
+}
+Check(crawlScores.First(score => score.Id == "budgets").Detail.Contains("Last evaluated")
+    && !crawlScores.Any(score => score.Detail.Contains("MTD")), "Crawl score prose never labels budget evaluations as MTD cost");
+var crawlTenant = Guid.NewGuid();
+var crawlToken = Token(crawlTenant, "crawl-user");
+var crawlCalls = 0;
+using var crawlHttp = new HttpClient(new StubHandler(request =>
+{
+    crawlCalls++;
+    return request.Method == HttpMethod.Post ? JsonResponse(new { data = Array.Empty<object>() })
+        : JsonResponse(new { value = Array.Empty<object>() });
+}));
+var savedCrawl = "";
+var crawlTool = new CrawlMaturityTools(new UserTokens { AzureToken = crawlToken },
+    (_, scores) => savedCrawl = scores, crawlHttp, TimeSpan.FromSeconds(30)).Create().Single();
+var crawlArguments = new AIFunctionArguments { ["subscriptionsJson"] = JsonSerializer.Serialize(
+    crawlScopes.Select(scope => new { id = scope.Id, name = scope.Name })) };
+var completeCrawl = await Invoke(crawlTool, crawlArguments);
+using (var result = JsonDocument.Parse(completeCrawl))
+{
+    Check(result.RootElement.GetProperty("complete").GetBoolean() && crawlCalls == 912,
+        "Crawl collects four categories and four Resource Graph projections for 227 scopes");
+    Check(result.RootElement.GetProperty("scores").GetArrayLength() == 7 && savedCrawl.Contains("evidenceComplete"),
+        "Crawl persists all seven scores with evidence completeness");
+    Check(Encoding.UTF8.GetByteCount(completeCrawl) < 24000, "Actual Crawl tool response stays within 24KB");
+    Console.WriteLine($"Crawl fixture response size: {Encoding.UTF8.GetByteCount(completeCrawl)} bytes");
+}
+await Invoke(crawlTool, crawlArguments);
+Check(crawlCalls == 912, "Repeated Crawl reuses caller-scoped evidence without more API calls");
+var anotherCrawl = new CrawlMaturityTools(new UserTokens { AzureToken = Token(crawlTenant, "other-user") },
+    (_, _) => { }, crawlHttp, TimeSpan.FromSeconds(30)).Create().Single();
+await Invoke(anotherCrawl, crawlArguments);
+Check(crawlCalls == 1824, "Crawl evidence is not shared between users in the same tenant");
+var allCrawl = new CrawlMaturityTools(new UserTokens { AzureToken = toolToken },
+    (_, _) => { }, crawlHttp, TimeSpan.FromSeconds(30)).Create().Single();
+using (var result = JsonDocument.Parse(await Invoke(allCrawl, new AIFunctionArguments { ["subscriptionsJson"] = "all" })))
+    Check(result.RootElement.GetProperty("evidence").GetProperty("subscriptionCount").GetInt32() == 230,
+        "Crawl all uses host discovery instead of a model-copied scope array");
+using (var truncatedHttp = new HttpClient(new StubHandler(request => request.Method == HttpMethod.Post
+    ? JsonResponse(new { data = Array.Empty<object>(), resultTruncated = "true" })
+    : JsonResponse(new { value = Array.Empty<object>() }))))
+{
+    var truncatedTool = new CrawlMaturityTools(new UserTokens { AzureToken = Token(Guid.NewGuid(), "truncated") },
+        (_, _) => { }, truncatedHttp, TimeSpan.FromSeconds(30)).Create().Single();
+    using var result = JsonDocument.Parse(await Invoke(truncatedTool, new AIFunctionArguments
+    {
+        ["subscriptionsJson"] = JsonSerializer.Serialize(new[] { new { id = Guid.NewGuid().ToString(), name = "Example" } })
+    }));
+    Check(!result.RootElement.GetProperty("complete").GetBoolean()
+        && result.RootElement.GetProperty("evidence").GetProperty("tagging").GetProperty("status").GetInt32() == 206,
+        "Truncated Resource Graph data cannot produce complete Crawl evidence");
+}
+var slowHandler = new CancelOnRequestHandler();
+using var slowHttp = new HttpClient(slowHandler);
+var partialTool = new CrawlMaturityTools(new UserTokens { AzureToken = Token(Guid.NewGuid(), "slow-crawl") },
+    (_, _) => { }, slowHttp, TimeSpan.FromMilliseconds(100)).Create().Single();
+var partialTimer = System.Diagnostics.Stopwatch.StartNew();
+var partialCrawl = await Invoke(partialTool, crawlArguments);
+using (var result = JsonDocument.Parse(partialCrawl))
+{
+    Check(!result.RootElement.GetProperty("complete").GetBoolean()
+        && result.RootElement.GetProperty("diagnostics").GetProperty("deadlineReached").GetBoolean(),
+        "Crawl deadline returns an explicitly incomplete assessment");
+    Check(result.RootElement.GetProperty("scores").EnumerateArray().All(score => !score.GetProperty("evidenceComplete").GetBoolean()),
+        "Timeouts never appear as verified absence of controls");
+}
+Check(partialTimer.Elapsed < TimeSpan.FromSeconds(5) && slowHandler.Requests <= 12 && slowHandler.Active == 0,
+    "Crawl cancels queued and in-flight work, preserving the concurrency bound");
+using (var cancelled = new CancellationTokenSource())
+using (var neverCalled = new HttpClient(new StubHandler(_ => throw new InvalidOperationException("Cancelled request reached HTTP"))))
+{
+    cancelled.Cancel();
+    var cancelledCorrectly = false;
+    try { await HttpHelper.SendCoreAsync(neverCalled, "https://management.azure.com/test", "test", null, "test", cancellationToken: cancelled.Token); }
+    catch (OperationCanceledException) { cancelledCorrectly = true; }
+    Check(cancelledCorrectly, "Cancelled evidence request does not reach HTTP");
+}
 Console.WriteLine("All large-tenant regression checks passed.");
 
 static void Check(bool condition, string name)
@@ -201,6 +339,23 @@ sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) 
 {
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
         Task.FromResult(respond(request));
+}
+
+sealed class CancelOnRequestHandler : HttpMessageHandler
+{
+    public int Requests;
+    public int Active;
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref Requests);
+        Interlocked.Increment(ref Active);
+        try
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException("Expected request cancellation");
+        }
+        finally { Interlocked.Decrement(ref Active); }
+    }
 }
 
 sealed class TestClock : TimeProvider

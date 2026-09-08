@@ -1,10 +1,13 @@
 using System.ComponentModel;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using AzureFinOps.Dashboard.Auth;
 using AzureFinOps.Dashboard.Infrastructure;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace AzureFinOps.Dashboard.AI.Tools;
 
@@ -16,29 +19,47 @@ namespace AzureFinOps.Dashboard.AI.Tools;
 public sealed class CrawlMaturityTools
 {
     private readonly UserTokens _tokens;
-    private readonly ScoreTools _scoreTools;
+    private readonly Action<string, string> _saveScore;
+    private readonly HttpClient? _http;
+    private readonly TimeSpan _evidenceTimeout;
+    private static readonly MemoryCache EvidenceCache = new(new MemoryCacheOptions { SizeLimit = 16 * 1024 * 1024 });
 
     public CrawlMaturityTools(UserTokens tokens, ScoreTools scoreTools)
+        : this(tokens, scoreTools.SaveScore, null, TimeSpan.FromSeconds(30))
+    {
+    }
+
+    internal CrawlMaturityTools(UserTokens tokens, Action<string, string> saveScore, HttpClient? http, TimeSpan evidenceTimeout)
     {
         _tokens = tokens;
-        _scoreTools = scoreTools;
+        _saveScore = saveScore;
+        _http = http;
+        _evidenceTimeout = evidenceTimeout;
     }
 
     public IEnumerable<AIFunction> Create()
     {
         yield return AIFunctionFactory.Create(GetCrawlMaturityEvidence, "GetCrawlMaturityEvidence", @"Collects, scores, and persists all seven Crawl maturity dimensions in ONE tool call: budgets/last evaluated spend, exact CostCenter/Owner/Environment tagging, exports, alerts/scheduled actions, policy guardrails, common waste, and cost visibility. It also returns ready-to-render fix actions. Low-cost metadata reads run with bounded server-side concurrency. Budget currentSpend is the last budget evaluation, not live Cost Analysis data; report it only as last evaluated spend with coverage, never as an authoritative live MTD total.
-    Use exactly once for Crawl/FinOps maturity scoring. Pass the exact `subscriptions` array and optional first management-group id from the connection context. Do NOT supplement it with QueryAzure, ReportMaturityScore, SuggestFollowUp, or any other tool—the score persistence, maturity SSE event, and follow-up buttons are already handled by this result.");
+    Use exactly once for Crawl/FinOps maturity scoring. Pass subscriptionsJson='all' for the full accessible estate, or an explicit JSON array for a user-selected subset. Discovery is host-side; never copy a long context array or use shell tools. Evidence reads have a 30-second budget and reuse caller-isolated successful reads for five minutes. Results are compact with coverage and provisional scores for incomplete evidence; partial scores are not proof that controls are missing. Do NOT supplement it with QueryAzure, ReportMaturityScore, SuggestFollowUp, shell, file-reading, or any other tool—the score persistence, maturity SSE event, and follow-up buttons are already handled by this result. Render the supplied scores and stop.");
     }
 
     private async Task<string> GetCrawlMaturityEvidence(
-        [Description("Exact subscriptions JSON array from the connection context, with id and name fields")] string subscriptionsJson,
-        [Description("Optional management-group id or full ARM path from the connection context")] string? managementGroupId = null)
+        [Description("Use 'all' for all accessible subscriptions, or an explicit JSON array of selected scopes with id/name fields")] string subscriptionsJson,
+        [Description("Legacy context hint only; does not filter subscriptions or audit inherited policies. Use explicit subscription scopes to narrow the assessment.")] string? managementGroupId = null)
     {
         var totalSw = System.Diagnostics.Stopwatch.StartNew();
         var token = _tokens.AzureToken;
         if (string.IsNullOrEmpty(token))
             return HttpHelper.TokenMissing("AzureToken", null, "crawl");
 
+        if (subscriptionsJson.Trim().Equals("all", StringComparison.OrdinalIgnoreCase))
+        {
+            var discovery = await AzureScopeDiscovery.SubscriptionsAsync(token);
+            if (!discovery.Complete)
+                return JsonSerializer.Serialize(new { complete = false, source = "scopeDiscovery", error = discovery.Error,
+                    guidance = "Subscription discovery is incomplete. No maturity score was calculated; retry discovery later." });
+            subscriptionsJson = JsonSerializer.Serialize(discovery.Scopes.Select(scope => new { id = scope.Id, name = scope.Name }));
+        }
         var (subscriptions, parseError) = ParseSubscriptions(subscriptionsJson);
         if (parseError is not null) return $"HTTP 400 BadRequest\n{parseError}";
         if (subscriptions.Count == 0) return "HTTP 400 BadRequest\nNo valid subscription IDs were supplied.";
@@ -55,33 +76,42 @@ public sealed class CrawlMaturityTools
             "resourcecontainers | where type =~ 'microsoft.resources/subscriptions/resourcegroups' | project subscriptionId, resourceGroup=name | join kind=leftouter (resources | summarize resourceCount=count() by subscriptionId, resourceGroup) on subscriptionId, resourceGroup | extend resourceCount=coalesce(resourceCount,0) | where resourceCount==0 | summarize emptyGroupCount=count(), names=make_set(resourceGroup,10) by subscriptionId";
 
         using var requestLimiter = new SemaphoreSlim(12, 12);
+        using var deadline = new CancellationTokenSource(_evidenceTimeout);
+        var cancellationToken = deadline.Token;
         var utcToday = DateOnly.FromDateTime(DateTime.UtcNow);
         var currentMonthStart = new DateOnly(utcToday.Year, utcToday.Month, 1);
 
-        var taggingTask = RunResourceGraph(token, ids, taggingQuery, "crawl.tagging", requestLimiter);
-        var policyTask = RunResourceGraph(token, ids, policyQuery, "crawl.policy", requestLimiter);
-        var wasteTask = RunResourceGraph(token, ids, wasteQuery, "crawl.waste", requestLimiter);
-        var emptyGroupsTask = RunResourceGraph(token, ids, emptyResourceGroupsQuery, "crawl.empty_groups", requestLimiter);
+        var taggingTask = RunResourceGraph(token, ids, taggingQuery, "crawl.tagging", requestLimiter, cancellationToken);
+        var policyTask = RunResourceGraph(token, ids, policyQuery, "crawl.policy", requestLimiter, cancellationToken);
+        var wasteTask = RunResourceGraph(token, ids, wasteQuery, "crawl.waste", requestLimiter, cancellationToken);
+        var emptyGroupsTask = RunResourceGraph(token, ids, emptyResourceGroupsQuery, "crawl.empty_groups", requestLimiter, cancellationToken);
+        var collectionTask = Task.WhenAll(subscriptions.Select(async scope =>
+        {
+            var budget = ReadArmCollection(token,
+                $"/subscriptions/{scope.Id}/providers/Microsoft.Consumption/budgets?api-version=2024-08-01",
+                "crawl.budgets", requestLimiter, cancellationToken);
+            var exports = ReadArmCollection(token,
+                $"/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/exports?api-version=2026-08-01",
+                "crawl.exports", requestLimiter, cancellationToken);
+            var actions = ReadArmCollection(token,
+                $"/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/scheduledActions?api-version=2025-03-01",
+                "crawl.scheduled_actions", requestLimiter, cancellationToken);
+            var alerts = ReadArmCollection(token,
+                $"/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/alerts?api-version=2026-08-01",
+                "crawl.alerts", requestLimiter, cancellationToken);
+            await Task.WhenAll(budget, exports, actions, alerts);
+            return (Budget: CompactBudget(scope, budget.Result, currentMonthStart, utcToday),
+                Exports: CompactCollection(scope, exports.Result), Actions: CompactCollection(scope, actions.Result),
+                Alerts: CompactCollection(scope, alerts.Result));
+        }));
 
-        var budgetTask = Task.WhenAll(subscriptions.Select(async s =>
-            (Scope: s, Response: await ReadArmCollection(
-                token,
-                $"/subscriptions/{s.Id}/providers/Microsoft.Consumption/budgets?api-version=2024-08-01",
-            "crawl.budgets",
-            requestLimiter))));
-        var exportsTask = ReadCollections(token, subscriptions, "exports", "crawl.exports", requestLimiter);
-        // scheduledActions has not adopted the newer general Cost Management
-        // API version; ARM returns UnsupportedApiVersion for 2026-08-01.
-        var actionsTask = ReadCollections(token, subscriptions, "scheduledActions", "crawl.scheduled_actions", requestLimiter, "2025-03-01");
-        var alertsTask = ReadCollections(token, subscriptions, "alerts", "crawl.alerts", requestLimiter);
-
-        await Task.WhenAll(taggingTask, policyTask, wasteTask, emptyGroupsTask,
-            budgetTask, exportsTask, actionsTask, alertsTask);
+        await Task.WhenAll(taggingTask, policyTask, wasteTask, emptyGroupsTask, collectionTask);
         var apiMs = totalSw.ElapsedMilliseconds;
 
-        var budgets = budgetTask.Result
-            .Select(x => CompactBudget(x.Scope, x.Response, currentMonthStart, utcToday))
-            .ToList();
+        var budgets = collectionTask.Result.Select(result => result.Budget).ToList();
+        var exportsEvidence = collectionTask.Result.Select(result => result.Exports).ToArray();
+        var actionsEvidence = collectionTask.Result.Select(result => result.Actions).ToArray();
+        var alertsEvidence = collectionTask.Result.Select(result => result.Alerts).ToArray();
         var currencies = budgets
             .Where(b => b.CurrentSpend is not null)
             .Select(b => b.Currency)
@@ -119,9 +149,9 @@ public sealed class CrawlMaturityTools
                 details = budgets
             },
             tagging = taggingTask.Result,
-            exports = exportsTask.Result,
-            scheduledActions = actionsTask.Result,
-            alerts = alertsTask.Result,
+            exports = exportsEvidence,
+            scheduledActions = actionsEvidence,
+            alerts = alertsEvidence,
             policy = policyTask.Result,
             waste = new
             {
@@ -145,9 +175,9 @@ public sealed class CrawlMaturityTools
             subscriptions,
             budgets,
             taggingTask.Result,
-            exportsTask.Result,
-            actionsTask.Result,
-            alertsTask.Result,
+            exportsEvidence,
+            actionsEvidence,
+            alertsEvidence,
             policyTask.Result,
             wasteTask.Result,
             emptyGroupsTask.Result,
@@ -155,19 +185,22 @@ public sealed class CrawlMaturityTools
             currencies.Length == 1 ? currencies[0] : null,
             totalsByCurrency);
         var scoreJson = JsonSerializer.Serialize(scores);
-        _scoreTools.SaveScore("crawl", scoreJson);
+        _saveScore("crawl", scoreJson);
+        var complete = scores.All(score => score.EvidenceComplete);
 
         var emptyGroups = DataRows(emptyGroupsTask.Result);
         var emptyGroupCount = emptyGroups.Sum(r => IntProperty(r, "emptyGroupCount"));
         var emptyGroupNames = emptyGroups
             .SelectMany(r => StringArrayProperty(r, "names"))
             .Take(3)
+            .Select(name => Truncate(name, 100))
             .ToArray();
-        var firstActionPrompt =
-            $"Review existing valid CostCenter, Owner, and Environment values, then apply missing tags consistently across {subscriptions.Count} subscriptions; configure missing daily exports and anomaly alerts. Ask before any write, use bulk operations, never invent placeholder tag values, do not delete resources, and summarize changes in one line.";
+        var firstActionPrompt = complete
+            ? $"Review existing valid CostCenter, Owner, and Environment values, then propose missing tags, daily exports and anomaly alerts across {subscriptions.Count} subscriptions. Ask before any write, never invent tag values, and do not delete resources."
+            : "Review the incomplete Crawl evidence categories and help me select a smaller subscription scope for a complete read-only assessment. Do not make changes.";
         var followUpActions = new[]
         {
-            new { label = "Auto-fix tags + exports + alerts", prompt = firstActionPrompt },
+            new { label = complete ? "Review tags + exports + alerts" : "Review incomplete Crawl checks", prompt = firstActionPrompt },
             new { label = "Re-score Crawl maturity", prompt = "Re-score my Crawl FinOps maturity across all connected subscriptions and compare it with the prior score." },
             new
             {
@@ -185,42 +218,29 @@ public sealed class CrawlMaturityTools
         return JsonSerializer.Serialize(new
         {
             kind = "crawl_maturity_result",
+            complete,
+            guidance = complete ? "Answer from the compact evidence; no more tools are required."
+                : "Provisional assessment: unread scopes are unknown, not missing controls. Use evidenceComplete on each score. Do not infer a complete estate rating or live cost total. No shell processing is required.",
             scores,
             followUp,
-            evidence,
+            evidence = SummarizeEvidence(evidence),
             diagnostics = new
             {
                 apiMs,
-                totalToolMs = totalSw.ElapsedMilliseconds
+                totalToolMs = totalSw.ElapsedMilliseconds,
+                evidenceBudgetSeconds = _evidenceTimeout.TotalSeconds,
+                deadlineReached = deadline.IsCancellationRequested,
+                cachePolicy = "Successful evidence reads may be up to 5 minutes old; cached budget spend remains last evaluated, not live cost."
             }
         });
     }
 
-    private async Task<IReadOnlyList<CollectionEvidence>> ReadCollections(
-        string token,
-        IReadOnlyList<SubscriptionScope> subscriptions,
-        string collection,
-        string telemetryPrefix,
-        SemaphoreSlim requestLimiter,
-        string apiVersion = "2026-08-01")
-    {
-        var tasks = subscriptions.Select(async s =>
-        {
-            var response = await ReadArmCollection(
-                token,
-                $"/subscriptions/{s.Id}/providers/Microsoft.CostManagement/{collection}?api-version={apiVersion}",
-                telemetryPrefix,
-                requestLimiter);
-            return CompactCollection(s, response);
-        });
-        return await Task.WhenAll(tasks);
-    }
-
-    private static async Task<string> SendArm(
+    private async Task<string> SendArm(
         string token,
         string path,
         string telemetryPrefix,
-        SemaphoreSlim requestLimiter)
+        SemaphoreSlim requestLimiter,
+        CancellationToken cancellationToken)
     {
         var url = path.StartsWith("https://management.azure.com/", StringComparison.OrdinalIgnoreCase)
             ? path
@@ -230,39 +250,66 @@ public sealed class CrawlMaturityTools
             || !uri.Host.Equals("management.azure.com", StringComparison.OrdinalIgnoreCase))
             return "HTTP 400 BadRequest\nInvalid ARM collection continuation URL.";
 
-        await requestLimiter.WaitAsync();
+        return await SendEvidence(token, uri.AbsoluteUri, telemetryPrefix, requestLimiter, cancellationToken);
+    }
+
+    private async Task<string> SendEvidence(string token, string url, string telemetryPrefix,
+        SemaphoreSlim requestLimiter, CancellationToken cancellationToken, string? body = null)
+    {
+        var key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { token, url, body }))));
+        if (EvidenceCache.TryGetValue(key, out string? cached)) return cached!;
+        var acquired = false;
         try
         {
-            return await HttpHelper.SendWithRetryAsync(
-                uri.AbsoluteUri,
-                token, null, telemetryPrefix,
+            await requestLimiter.WaitAsync(cancellationToken);
+            acquired = true;
+            var response = await HttpHelper.SendCoreAsync(_http, url, token, null, telemetryPrefix,
+                method: body is null ? HttpMethod.Get : HttpMethod.Post, jsonBody: body,
                 bypassCostManagementGate: true,
-                maxAttemptsOverride: 1);
+                maxAttemptsOverride: 1, cancellationToken: cancellationToken);
+            if (ParseStatus(response) == 200 && Encoding.UTF8.GetByteCount(response) <= 512 * 1024)
+                EvidenceCache.Set(key, response, new MemoryCacheEntryOptions
+                {
+                    Size = Encoding.UTF8.GetByteCount(response), AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5)
+                });
+            return response;
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        catch (OperationCanceledException)
         {
-            return $"HTTP 0 TransportError\n{Truncate(ex.Message, 300)}";
+            return acquired ? "HTTP 408 RequestTimeout\nEvidence request exceeded the time budget; scope is unknown."
+                : "HTTP 0 NotAttempted\nEvidence budget expired before the request started; scope is unknown.";
+        }
+        catch (HttpRequestException)
+        {
+            return "HTTP 0 TransportError\nEvidence request failed; scope is unknown.";
         }
         finally
         {
-            requestLimiter.Release();
+            if (acquired) requestLimiter.Release();
         }
     }
 
-    private static async Task<string> ReadArmCollection(
+    private async Task<string> ReadArmCollection(
         string token,
         string initialPath,
         string telemetryPrefix,
-        SemaphoreSlim requestLimiter)
+        SemaphoreSlim requestLimiter,
+        CancellationToken cancellationToken)
     {
         const int maxPages = 20;
         const int maxItems = 5000;
         var values = new List<JsonElement>();
         var next = initialPath;
+        var initialUri = new Uri($"https://management.azure.com{initialPath}");
+        var visited = new HashSet<string>(StringComparer.Ordinal);
 
         for (var page = 0; page < maxPages; page++)
         {
-            var response = await SendArm(token, next, telemetryPrefix, requestLimiter);
+            if (!Uri.TryCreate(initialUri, next, out var nextUri)
+                || !AzureScopeDiscovery.IsSafeContinuation(nextUri, initialUri.AbsolutePath)
+                || !visited.Add(nextUri.AbsoluteUri))
+                return "HTTP 0 InvalidContinuation\nEvidence pagination is incomplete.";
+            var response = await SendArm(token, nextUri.AbsoluteUri, telemetryPrefix, requestLimiter, cancellationToken);
             if (ParseStatus(response) != 200) return response;
 
             try
@@ -294,12 +341,13 @@ public sealed class CrawlMaturityTools
         return $"HTTP 206 PartialContent\nARM collection exceeded the {maxPages}-page safety limit.";
     }
 
-    private static async Task<object> RunResourceGraph(
+    private async Task<object> RunResourceGraph(
         string token,
         string[] subscriptions,
         string query,
         string telemetryPrefix,
-        SemaphoreSlim requestLimiter)
+        SemaphoreSlim requestLimiter,
+        CancellationToken cancellationToken)
     {
         const int maxRows = 5000;
         var rows = new List<JsonElement>();
@@ -315,24 +363,9 @@ public sealed class CrawlMaturityTools
             if (!string.IsNullOrWhiteSpace(skipToken)) options["$skipToken"] = skipToken;
             var body = JsonSerializer.Serialize(new { subscriptions, query, options });
 
-            await requestLimiter.WaitAsync();
-            string response;
-            try
-            {
-                response = await HttpHelper.SendWithRetryAsync(
-                    "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2024-04-01",
-                    token, null, telemetryPrefix,
-                    method: HttpMethod.Post,
-                    jsonBody: body);
-            }
-            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
-            {
-                return new { status = 0, error = Truncate(ex.Message, 300) };
-            }
-            finally
-            {
-                requestLimiter.Release();
-            }
+            var response = await SendEvidence(token,
+                "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2024-04-01",
+                telemetryPrefix, requestLimiter, cancellationToken, body);
 
             var status = ParseStatus(response);
             if (status != 200)
@@ -356,6 +389,9 @@ public sealed class CrawlMaturityTools
                         : null;
                 if (string.IsNullOrWhiteSpace(skipToken))
                 {
+                    if (doc.RootElement.TryGetProperty("resultTruncated", out var truncated)
+                        && (truncated.ValueKind == JsonValueKind.True || truncated.ToString().Equals("true", StringComparison.OrdinalIgnoreCase)))
+                        return new { status = 206, error = "Resource Graph truncated evidence without a continuation token; coverage is incomplete." };
                     var serializedRows = JsonSerializer.Deserialize<JsonElement>(JsonSerializer.Serialize(rows));
                     return new { status = 200, data = serializedRows };
                 }
@@ -456,7 +492,7 @@ public sealed class CrawlMaturityTools
         }
     }
 
-    private static IReadOnlyList<MaturityScore> BuildScores(
+    internal static IReadOnlyList<MaturityScore> BuildScores(
         IReadOnlyList<SubscriptionScope> subscriptions,
         IReadOnlyList<BudgetEvidence> budgets,
         object taggingProjection,
@@ -486,14 +522,16 @@ public sealed class CrawlMaturityTools
             >= 30 => 2,
             _ => 1
         };
-        var tagSpread = string.Join(", ", subscriptions.Select(s =>
+        var tagSpread = string.Join(", ", subscriptions.OrderByDescending(scope => tagRows
+            .Where(row => StringProperty(row, "subscriptionId").Equals(scope.Id, StringComparison.OrdinalIgnoreCase))
+            .Sum(row => IntProperty(row, "total"))).Take(3).Select(s =>
         {
             var row = tagRows.FirstOrDefault(r =>
                 StringProperty(r, "subscriptionId").Equals(s.Id, StringComparison.OrdinalIgnoreCase));
             var total = row.ValueKind == JsonValueKind.Undefined ? 0 : IntProperty(row, "total");
             var governed = row.ValueKind == JsonValueKind.Undefined ? 0 : IntProperty(row, "fullyTagged");
             var pct = total == 0 ? 0 : Math.Round(governed * 100.0 / total, 1);
-            return $"{pct}% in {s.Name}";
+            return $"{pct}% in {Truncate(s.Name, 100)}";
         }));
 
         var coveredBudgets = budgets.Count(b => b.Status == 200 && b.BudgetCount > 0);
@@ -551,12 +589,14 @@ public sealed class CrawlMaturityTools
             <= 10 => 2,
             _ => 1
         };
-        var emptyGroupSpread = string.Join(", ", subscriptions.Select(s =>
+        var emptyGroupSpread = string.Join(", ", subscriptions.OrderByDescending(scope => emptyGroupRows
+            .Where(row => StringProperty(row, "subscriptionId").Equals(scope.Id, StringComparison.OrdinalIgnoreCase))
+            .Sum(row => IntProperty(row, "emptyGroupCount"))).Take(3).Select(s =>
         {
             var row = emptyGroupRows.FirstOrDefault(r =>
                 StringProperty(r, "subscriptionId").Equals(s.Id, StringComparison.OrdinalIgnoreCase));
             var count = row.ValueKind == JsonValueKind.Undefined ? 0 : IntProperty(row, "emptyGroupCount");
-            return $"{count} in {s.Name}";
+            return $"{count} in {Truncate(s.Name, 100)}";
         }));
 
         var visibleSubscriptions = budgets.Count(b => b.Status == 200 && b.CurrentSpend is not null);
@@ -568,26 +608,46 @@ public sealed class CrawlMaturityTools
         var spendSpread = string.Join(", ", budgets
             .Where(b => b.CurrentSpend is not null)
             .OrderByDescending(b => b.CurrentSpend)
-            .Select(b => $"{b.CurrentSpend!.Value.ToString("N2", CultureInfo.InvariantCulture)} {b.Currency ?? "currency unknown"} in {b.SubscriptionName}"));
+            .Take(3)
+            .Select(b => $"{b.CurrentSpend!.Value.ToString("N2", CultureInfo.InvariantCulture)} {b.Currency ?? "currency unknown"} in {Truncate(b.SubscriptionName, 100)}"));
         var spendSummary = FormatCostSummary(mtdSpend, mtdCurrency, totalsByCurrency);
 
-        return
+        MaturityScore[] scores =
         [
             new("budgets", "Budgets & thresholds", budgetScore,
-                $"{coveredBudgets}/{subscriptions.Count} subscriptions have budgets; {budgets.Sum(b => b.BudgetCount)} budgets expose {notificationCount} enabled actual/forecast notifications and {spendSummary} from strict unfiltered monthly budgets."),
+                $"{coveredBudgets}/{subscriptions.Count} subscriptions have budgets; {budgets.Sum(b => b.BudgetCount)} budgets expose {notificationCount} enabled actual/forecast notifications. Last evaluated spend (not live Cost Analysis): {spendSummary}; coverage {visibleSubscriptions}/{subscriptions.Count}."),
             new("tagging", "Tagging for accountability", tagScore,
-                $"Valid CostCenter+Owner+Environment coverage is {Math.Round(tagCoverage, 1)}% across {totalResources} resources ({tagSpread}); exact valid-key counts are CostCenter={costCenter}, Owner={owner}, Environment={environment}, with {placeholderTags} placeholder values excluded."),
+                $"Valid CostCenter+Owner+Environment coverage is {Math.Round(tagCoverage, 1)}% across {totalResources} resources (largest 3 scopes: {tagSpread}); exact valid-key counts are CostCenter={costCenter}, Owner={owner}, Environment={environment}, with {placeholderTags} placeholder values excluded."),
             new("exports", "Cost data exports", exportsScore,
                 $"{exportCount} exports cover {exportCoverage}/{subscriptions.Count} subscriptions; {exports.Count(e => e.Status == 200)}/{subscriptions.Count} export-list calls succeeded."),
             new("alerts", "Cost alerts & scheduled actions", alertsScore,
                 $"{alertCount} cost alerts and {actionCount} scheduled actions cover {alertCoverage}/{subscriptions.Count} subscriptions; {alerts.Count(a => a.Status == 200) + scheduledActions.Count(a => a.Status == 200)}/{subscriptions.Count * 2} list calls succeeded."),
             new("policy", "Governance guardrails", policyScore,
-                $"{finOpsPolicies} FinOps-related policy assignments were found among {totalPolicies} total assignments, covering {policyCoverage}/{subscriptions.Count} subscriptions."),
+                $"Policy metadata keyword scan identified {finOpsPolicies} candidate FinOps assignments among {totalPolicies}, covering {policyCoverage}/{subscriptions.Count} subscriptions. This is not a full policy-definition or inherited-policy audit."),
             new("waste", "Waste identification & cleanup", wasteScore,
-                $"{totalWaste} waste items were found: {commonWaste} unattached disks/orphaned IPs/empty paid App Service plans plus {emptyGroups} empty resource groups ({emptyGroupSpread})."),
+                $"{commonWaste} potential cost-waste resources and {emptyGroups} empty resource groups were found (largest 3 empty-group counts: {emptyGroupSpread}). Empty resource groups themselves have no resource charge; these are hygiene findings, not estimated savings."),
             new("visibility", "Cost visibility & ownership", visibilityScore,
-                $"Last budget evaluation (not live Cost Analysis) provides {spendSummary} across {visibleSubscriptions}/{subscriptions.Count} subscriptions ({spendSpread}); governed ownership-tag coverage is {Math.Round(tagCoverage, 1)}% across {totalResources} resources.")
+                $"Last budget evaluation (not live Cost Analysis) provides {spendSummary} across {visibleSubscriptions}/{subscriptions.Count} subscriptions (top 3: {spendSpread}); governed ownership-tag coverage is {Math.Round(tagCoverage, 1)}% across {totalResources} resources.")
         ];
+        return scores.Select(score =>
+        {
+            var evidenceComplete = score.Id switch
+            {
+                "budgets" => allBudgetReadsOk,
+                "tagging" => ProjectionStatus(taggingProjection) == 200,
+                "exports" => exports.All(item => item.Status == 200),
+                "alerts" => alertsReadable,
+                "policy" => ProjectionStatus(policyProjection) == 200,
+                "waste" => wasteReadable,
+                "visibility" => allBudgetReadsOk && ProjectionStatus(taggingProjection) == 200,
+                _ => false
+            };
+            return score with
+            {
+                EvidenceComplete = evidenceComplete,
+                Detail = evidenceComplete ? score.Detail : "Incomplete evidence; provisional score, unread scopes are unknown. " + score.Detail
+            };
+        }).ToArray();
     }
 
     private static string FormatCostSummary(
@@ -596,12 +656,85 @@ public sealed class CrawlMaturityTools
         IReadOnlyDictionary<string, double> totalsByCurrency)
     {
         if (total is not null && !string.IsNullOrWhiteSpace(currency))
-            return $"{total.Value.ToString("N2", CultureInfo.InvariantCulture)} {currency} MTD";
+            return $"{total.Value.ToString("N2", CultureInfo.InvariantCulture)} {currency}";
         if (totalsByCurrency.Count > 0)
             return string.Join(" + ", totalsByCurrency
                 .OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase)
-                .Select(kvp => $"{kvp.Value.ToString("N2", CultureInfo.InvariantCulture)} {kvp.Key} MTD"));
-        return "no validated MTD spend";
+                .Select(kvp => $"{kvp.Value.ToString("N2", CultureInfo.InvariantCulture)} {kvp.Key}"));
+        return "no validated budget evaluation";
+    }
+
+    internal static object SummarizeEvidence(object evidence)
+    {
+        var root = JsonSerializer.SerializeToElement(evidence);
+        var budgets = root.GetProperty("budgets");
+        var summary = new Dictionary<string, object?>
+        {
+            ["generatedUtc"] = root.GetProperty("generatedUtc"),
+            ["subscriptionCount"] = root.GetProperty("subscriptionCount"),
+            ["detailPolicy"] = "Totals use all collected evidence; samples show at most 3 items per category. No shell processing is needed.",
+            ["budgets"] = budgets.EnumerateObject().Where(property => property.Name != "details")
+                .ToDictionary(property => property.Name, property => property.Value),
+            ["budgetReads"] = SummarizeCollection(budgets.GetProperty("details")),
+            ["visibility"] = root.GetProperty("visibility")
+        };
+        foreach (var name in new[] { "exports", "scheduledActions", "alerts" })
+            summary[name] = SummarizeCollection(root.GetProperty(name));
+        foreach (var name in new[] { "tagging", "policy" })
+            summary[name] = SummarizeProjection(root.GetProperty(name));
+        var waste = root.GetProperty("waste");
+        summary["waste"] = new
+        {
+            commonPatterns = SummarizeProjection(waste.GetProperty("commonPatterns")),
+            emptyResourceGroups = SummarizeProjection(waste.GetProperty("emptyResourceGroups"))
+        };
+        return summary;
+    }
+
+    private static object SummarizeCollection(JsonElement collection)
+    {
+        var rows = collection.EnumerateArray().ToArray();
+        return new
+        {
+            scopes = rows.Length,
+            succeeded = rows.Count(row => IntProperty(row, "Status") == 200),
+            failed = rows.Count(row => IntProperty(row, "Status") != 200),
+            notAttemptedOrTransportFailed = rows.Count(row => IntProperty(row, "Status") == 0),
+            timedOut = rows.Count(row => IntProperty(row, "Status") == 408),
+            statuses = rows.GroupBy(row => IntProperty(row, "Status")).ToDictionary(group => group.Key, group => group.Count()),
+            itemCount = rows.Sum(row => IntProperty(row, "Count") + IntProperty(row, "BudgetCount")),
+            failureSamples = rows.Where(row => IntProperty(row, "Status") != 200).Take(3)
+                .Select(row => new { subscription = Truncate(StringProperty(row, "SubscriptionName"), 100), status = IntProperty(row, "Status") })
+        };
+    }
+
+    private static object SummarizeProjection(JsonElement projection)
+    {
+        var rows = projection.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array
+            ? data.EnumerateArray().ToArray() : [];
+        var totals = new Dictionary<string, double>();
+        foreach (var row in rows)
+        foreach (var property in row.EnumerateObject())
+        {
+            if (property.Value.ValueKind == JsonValueKind.Number && property.Value.TryGetDouble(out var number))
+                totals[property.Name] = totals.GetValueOrDefault(property.Name) + number;
+        }
+        return new
+        {
+            status = IntProperty(projection, "status"),
+            error = Truncate(StringProperty(projection, "error"), 200),
+            rowCount = rows.Length,
+            totals,
+            samplesTruncated = rows.Length > 3,
+            samples = rows.Take(3).Select(row => row.EnumerateObject().ToDictionary(property => property.Name,
+                property => property.Value.ValueKind switch
+                {
+                    JsonValueKind.String => (object?)Truncate(property.Value.GetString() ?? "", 100),
+                    JsonValueKind.Array => property.Value.EnumerateArray().Take(3)
+                        .Select(value => Truncate(value.ToString(), 100)).ToArray(),
+                    _ => property.Value
+                }))
+        };
     }
 
     private static List<JsonElement> DataRows(object projection)
@@ -670,8 +803,8 @@ public sealed class CrawlMaturityTools
             using var doc = JsonDocument.Parse(json);
             if (doc.RootElement.ValueKind != JsonValueKind.Array)
                 return (scopes, "subscriptionsJson must be a JSON array.");
-            if (doc.RootElement.GetArrayLength() > 500)
-                return (scopes, "subscriptionsJson supports at most 500 entries; split larger estates into explicit scopes.");
+            if (doc.RootElement.GetArrayLength() > 10000)
+                return (scopes, "subscriptionsJson supports at most 10000 entries; use a smaller explicit scope.");
 
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var item in doc.RootElement.EnumerateArray())
@@ -715,9 +848,9 @@ public sealed class CrawlMaturityTools
     private static string Truncate(string value, int length) =>
         value.Length <= length ? value : value[..length];
 
-    private sealed record SubscriptionScope(string Id, string Name);
+    internal sealed record SubscriptionScope(string Id, string Name);
 
-    private sealed record BudgetEvidence(
+    internal sealed record BudgetEvidence(
         string SubscriptionId,
         string SubscriptionName,
         int Status,
@@ -729,7 +862,7 @@ public sealed class CrawlMaturityTools
         int EnabledForecastNotifications,
         string? Error);
 
-    private sealed record CollectionEvidence(
+    internal sealed record CollectionEvidence(
         string SubscriptionId,
         string SubscriptionName,
         int Status,
@@ -737,9 +870,10 @@ public sealed class CrawlMaturityTools
         string[] Names,
         string? Error);
 
-    private sealed record MaturityScore(
+    internal sealed record MaturityScore(
         [property: JsonPropertyName("id")] string Id,
         [property: JsonPropertyName("label")] string Label,
         [property: JsonPropertyName("score")] int Score,
-        [property: JsonPropertyName("detail")] string Detail);
+        [property: JsonPropertyName("detail")] string Detail,
+        [property: JsonPropertyName("evidenceComplete")] bool EvidenceComplete = true);
 }

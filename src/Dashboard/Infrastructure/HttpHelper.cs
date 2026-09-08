@@ -3,6 +3,8 @@ using System.Diagnostics.Metrics;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.Extensions.Caching.Memory;
 
 namespace AzureFinOps.Dashboard.Infrastructure;
@@ -103,12 +105,13 @@ public static class HttpHelper
         Dictionary<string, string>? extraHeaders = null,
         int? maxResponseChars = null,
         bool bypassCostManagementGate = false,
-        int? maxAttemptsOverride = null)
+        int? maxAttemptsOverride = null,
+        CancellationToken cancellationToken = default)
         => SendCoreAsync(Http, url, token, activity, telemetryPrefix, method, jsonBody, includeTimestamp,
-            extraHeaders, maxResponseChars, bypassCostManagementGate, maxAttemptsOverride);
+            extraHeaders, maxResponseChars, bypassCostManagementGate, maxAttemptsOverride, cancellationToken);
 
     internal static async Task<string> SendCoreAsync(
-        HttpClient http,
+        HttpClient? http,
         string url,
         string token,
         Activity? activity,
@@ -119,8 +122,11 @@ public static class HttpHelper
         Dictionary<string, string>? extraHeaders = null,
         int? maxResponseChars = null,
         bool bypassCostManagementGate = false,
-        int? maxAttemptsOverride = null)
+        int? maxAttemptsOverride = null,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        http ??= Http;
         method ??= HttpMethod.Get;
 
         var totalSw = Stopwatch.StartNew();
@@ -151,12 +157,12 @@ public static class HttpHelper
         var heldGate = false;
         if (isCostMgmt)
         {
-            if (!await gate.WaitAsync(CostMgmtQueueNotifyMs))
+            if (!await gate.WaitAsync(CostMgmtQueueNotifyMs, cancellationToken))
             {
                 // Couldn't grab the gate immediately — surface a queue-wait event
                 // and keep retrying every ~3s so the ghost row stays alive in the UI.
                 var queuedSw = Stopwatch.StartNew();
-                while (!await gate.WaitAsync(3000))
+                while (!await gate.WaitAsync(3000, cancellationToken))
                 {
                     Logger?.LogInformation("HTTP queued {Tool} waitedSec={Wait:F1} url={Url}",
                         telemetryPrefix, queuedSw.Elapsed.TotalSeconds, url);
@@ -187,11 +193,18 @@ public static class HttpHelper
             }
             if (costQuery?.RetryAfterSeconds is > 0)
             {
+                var remainingSeconds = costQuery.RetryAfterSeconds;
                 activity?.SetTag($"{telemetryPrefix}.result", "tenant_cooldown");
                 activity?.SetTag($"{telemetryPrefix}.status_code", 429);
                 activity?.SetStatus(ActivityStatusCode.Error, "Tenant cost query cooldown");
-                return $"HTTP 429 TooManyRequests\nRetry-After: {Math.Ceiling(costQuery.RetryAfterSeconds):F0} seconds.\n"
-                    + "{\"error\":{\"code\":\"TenantCostCooldown\",\"message\":\"No Azure request was sent. A previous query was throttled; retry after the cooldown.\"}}";
+                if (report is not null)
+                {
+                    try { await report(0, remainingSeconds, url, telemetryPrefix, 429); }
+                    catch (Exception exception) { Logger?.LogWarning(exception, "SSE cooldown emit failed for {Tool}", telemetryPrefix); }
+                }
+                return FormatThrottleResponse(
+                    "{\"error\":{\"code\":\"TenantCostCooldown\",\"message\":\"No Azure request was sent. A previous query was throttled; retry after the cooldown.\"}}",
+                    remainingSeconds, "localCooldown", "retainedCooldown");
             }
             var maxAttempts = Math.Clamp(
                 maxAttemptsOverride ?? (IsInteractiveCostQueryUrl(url)
@@ -203,7 +216,7 @@ public static class HttpHelper
             {
                 if (costQuery is not null)
                 {
-                    await Task.Delay(costQuery.PacingDelay);
+                    await Task.Delay(costQuery.PacingDelay, cancellationToken);
                     costQuery.RecordRequest();
                 }
                 using var req = new HttpRequestMessage(method, url);
@@ -239,7 +252,7 @@ public static class HttpHelper
 
                 try
                 {
-                    res = await http.SendAsync(req);
+                    res = await http.SendAsync(req, cancellationToken);
                 }
                 finally
                 {
@@ -254,20 +267,30 @@ public static class HttpHelper
                 var isTransientServer = status == 502 || status == 503 || status == 504;
                 if (!isThrottle && !isTransientServer) break;
 
-                var waitSeconds = ResolveRetryAfterSeconds(res, attempt);
+                var serverDelay = ReadServerRetryAfterSeconds(res);
+                var waitSeconds = isThrottle && costQuery is not null && serverDelay <= 0
+                    ? 60 : ResolveRetryAfterSeconds(res, attempt);
                 finalRetrySeconds = waitSeconds;
                 if (isThrottle)
                 {
                     costQuery?.RecordThrottle(waitSeconds);
                     activity?.SetTag($"{telemetryPrefix}.retry_after_sec", waitSeconds);
+                    activity?.SetTag($"{telemetryPrefix}.retry_delay_source", serverDelay > 0 ? "server" : "fallback");
                     if (res.Headers.TryGetValues("x-ms-request-id", out var requestIds))
                         activity?.SetTag($"{telemetryPrefix}.request_id", requestIds.FirstOrDefault());
                 }
-                if (attempt == maxAttempts - 1) break;
                 var waitBudget = IsInteractiveCostQueryUrl(url)
                     ? MaxInteractiveRetryWaitSeconds
                     : MaxRetryWaitSeconds;
-                if (waitSeconds > waitBudget) break;
+                if (attempt == maxAttempts - 1 || waitSeconds > waitBudget)
+                {
+                    if (isThrottle && report is not null)
+                    {
+                        try { await report(attempt + 1, waitSeconds, url, telemetryPrefix, status); }
+                        catch (Exception exception) { Logger?.LogWarning(exception, "SSE cooldown emit failed for {Tool}", telemetryPrefix); }
+                    }
+                    break;
+                }
                 totalWaitSec += waitSeconds;
                 retryCount++;
                 var reason = isThrottle ? "429" : status.ToString();
@@ -295,7 +318,7 @@ public static class HttpHelper
                         turnKey ?? "<none>", telemetryPrefix);
                 }
                 res.Dispose();
-                await Task.Delay(TimeSpan.FromSeconds(waitSeconds));
+                await Task.Delay(TimeSpan.FromSeconds(waitSeconds), cancellationToken);
             }
         }
         finally
@@ -304,7 +327,7 @@ public static class HttpHelper
         }
 
         using var finalResponse = res;
-        var responseBody = await res.Content.ReadAsStringAsync();
+        var responseBody = await res.Content.ReadAsStringAsync(cancellationToken);
         totalSw.Stop();
 
         RequestTotalMs.Record(totalSw.Elapsed.TotalMilliseconds,
@@ -327,14 +350,17 @@ public static class HttpHelper
         if (!res.IsSuccessStatusCode)
             activity?.SetStatus(ActivityStatusCode.Error, $"HTTP {(int)res.StatusCode}");
 
+        if ((int)res.StatusCode == 429)
+            return FormatThrottleResponse(responseBody, finalRetrySeconds, "azure",
+                ReadServerRetryAfterSeconds(res) > 0 ? "server" : "fallback",
+                res.Headers.TryGetValues("x-ms-request-id", out var ids) ? ids.FirstOrDefault() : null);
+
         var result = $"HTTP {(int)res.StatusCode} {res.StatusCode}";
         if (cacheKey is not null && res.IsSuccessStatusCode)
             result += $"; Cost data fetched at UTC {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}; may be reused for up to 5 minutes. Azure cost ingestion may lag usage.";
         result += "\n";
         if (includeTimestamp && cacheKey is null)
             result += $"Current UTC time: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}\n";
-        if ((int)res.StatusCode == 429)
-            result += $"Retry-After: {Math.Ceiling(finalRetrySeconds):F0} seconds. Do not retry before this delay.\n";
 
         // Trim chatty PUT/PATCH echoes — ARM returns the full resource (often 5–20KB) on success.
         // For bulk mutations this dominates LLM input tokens with no informational value.
@@ -383,10 +409,29 @@ public static class HttpHelper
         return result;
     }
 
-    /// <summary>
-    /// Returns the longest server retry delay without shortening it, or exponential backoff.
-    /// </summary>
-    private static double ResolveRetryAfterSeconds(HttpResponseMessage res, int attempt)
+    private static string FormatThrottleResponse(string body, double seconds, string source, string delaySource, string? requestId = null)
+    {
+        JsonObject root;
+        try { root = JsonNode.Parse(body) as JsonObject ?? new JsonObject(); }
+        catch (JsonException) { root = new JsonObject(); }
+        if (root["error"] is null)
+            root["error"] = new JsonObject { ["code"] = "429", ["message"] = "Too many requests. Retry after the cooldown." };
+        var now = DateTimeOffset.UtcNow;
+        var retryAt = seconds >= (DateTimeOffset.MaxValue - now).TotalSeconds
+            ? DateTimeOffset.MaxValue : now.AddSeconds(seconds);
+        root["finopsRetry"] = new JsonObject
+        {
+            ["source"] = source,
+            ["retryAfterSeconds"] = Math.Ceiling(seconds),
+            ["retryAtUtc"] = retryAt.ToString("o"),
+            ["delaySource"] = delaySource,
+            ["requestId"] = requestId,
+            ["guidance"] = "Do not issue more cost queries this turn. Retry after retryAtUtc; that time is not a guarantee Azure quota will be available."
+        };
+        return $"HTTP 429 TooManyRequests; Retry-After: {Math.Ceiling(seconds):F0} seconds.\n{root.ToJsonString()}";
+    }
+
+    private static double ReadServerRetryAfterSeconds(HttpResponseMessage res)
     {
         var standard = res.Headers.RetryAfter?.Delta?.TotalSeconds
                     ?? res.Headers.RetryAfter?.Date?.Subtract(DateTimeOffset.UtcNow).TotalSeconds;
@@ -405,8 +450,16 @@ public static class HttpHelper
                     delay = Math.Max(delay, seconds);
             }
         }
-        if (delay > 0) return Math.Max(1, delay);
+        return delay;
+    }
 
+    /// <summary>
+    /// Returns the longest server retry delay without shortening it, or exponential backoff.
+    /// </summary>
+    private static double ResolveRetryAfterSeconds(HttpResponseMessage res, int attempt)
+    {
+        var delay = ReadServerRetryAfterSeconds(res);
+        if (delay > 0) return Math.Max(1, delay);
         var backoff = Math.Pow(2, attempt + 1); // 2, 4, 8, 16, 32
         var jitter = Random.Shared.NextDouble(); // 0..1s
         return Math.Min(backoff + jitter, MaxRetryWaitSeconds);

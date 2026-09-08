@@ -8,6 +8,8 @@ Azure FinOps Agent is an open-source Azure sample and delivery accelerator. It c
 
 It is designed for customers to deploy into **their own tenant and subscription**. Never commit maintainer or customer tenant IDs, subscription IDs, resource IDs, generated resource names, app IDs, user principal names, email addresses, IP addresses, connection strings, or deployment credentials.
 
+This applies to all code, tests, documentation, examples, runbooks, and copied logs that can be committed. Use placeholders or runtime prompts for deployment targets and generate synthetic identifiers in tests. Never copy real Azure names, GUIDs, identifiers, or personal information from a conversation into these files. Check the staged diff for such data before committing or pushing.
+
 ## Stack
 
 - Backend: .NET 10 minimal API in `src/Dashboard`
@@ -88,6 +90,7 @@ Before manually testing a fresh consent flow, revoke existing grants for the tes
 - Parallelize independent calls, except Cost Management `/query` and `/forecast`, which are tenant-throttled.
 - Never issue multiple Cost Management query calls in parallel. After a final 429, stop querying that service for the turn.
 - Cost query/forecast requests share a tenant-keyed semaphore, one-second spacing, and cooldown across users, turns, and scheduled jobs in the same process. Tenant claims are used only for throttle bucketing, never authorization. Honor the longest positive standard or Cost Management/Consumption retry hint; return long cooldowns instead of shortening them. Multi-instance hosting needs distributed rate/cooldown coordination.
+- Every 429 includes a `finopsRetry` JSON object with retry time, delay source, and Azure-versus-local-cooldown source. Do not rely on text before the JSON body: the execution panel's JSON formatter omits it. Headerless cost-query throttles use a labelled 60-second fallback and no rapid retry; this is not a guarantee of quota availability.
 - Successful cost-query responses are cached for five minutes under hashed caller-token + request keys, never across principals. Preserve fetch-time guidance and the HTTP-status-line + JSON-body contract.
 - Scope discovery follows subscription and management-group pages with same-host/path HTTPS continuation validation, a five-minute caller-token-isolated cache, and explicit incomplete flags. Use `FindSubscriptions` for bounded name/id resolution, never shell parsing of ARM inventory. Cache/prompt bounds are not proof that all scopes were discovered.
 
@@ -106,7 +109,11 @@ Use `QueryCostsAcrossSubscriptions` exactly once for all-subscription totals.
 Use `GetCrawlMaturityEvidence` exactly once for explicit Crawl scoring.
 
 - It runs budget/current-spend, required-tag, exports, alert/scheduled-action, policy, common-waste, and empty-resource-group checks concurrently.
+- Pass `subscriptionsJson='all'` for host-side discovery; explicit arrays select a subset. Do not copy a large connection-context array. The legacy management-group argument is not a scope filter or an inherited-policy audit.
+- Evidence reads have a shared 30-second deadline after discovery, a 12-request concurrency cap, and interleaved collection categories. Queued and in-flight work must respect cancellation. Successful reads cache for five minutes under caller-token/request hashes; incomplete results are explicitly provisional, never proof of absent controls.
+- Compute scores using all collected evidence, but return aggregate counts and at most three samples per category. Preserve the `kind`, `scores`, and `followUp` SSE contract. Never send the full per-subscription evidence to the model or ask it to shell-parse Crawl results.
 - It computes and persists all seven scores and returns follow-up actions.
+- Each score carries `evidenceComplete`; the top-level `complete` flag describes collection completeness. Policy evidence remains a metadata keyword scan, not a definition/effect audit. Empty resource groups are hygiene findings, not billable resources or quantified savings.
 - Budget-based spend evidence is explicitly labeled last evaluated, with coverage and unknown evaluation time; it is not live MTD cost.
 - `ChatEndpoints` emits `maturity_score` and `follow_up` directly.
 - Do not call `QueryAzure`, `FindIdleResources`, `ReportMaturityScore`, or `SuggestFollowUp` in the same Crawl turn.
@@ -181,7 +188,7 @@ The frontend must be built before backend startup so `wwwroot` exists when ASP.N
 ## Testing
 
 - Backend: `dotnet build src/Dashboard/Dashboard.csproj --no-restore`
-- Large-tenant regression checks (no Azure calls): `dotnet run --project tests/LargeTenant.RegressionTests -p:CopilotSkipCliDownload=true`. Uses the actual Dashboard assembly with fake HTTP responses; covers retries, cooldown/pacing, caching isolation, pagination, compact lookup, and incomplete cost results.
+- Large-tenant regression checks (no Azure calls): `dotnet run --project tests/LargeTenant.RegressionTests -p:CopilotSkipCliDownload=true`. Uses the actual Dashboard assembly with fake HTTP responses; covers retries, structured cooldown reporting, caching isolation, pagination, compact lookup, incomplete cost results, and bounded/cancellable Crawl assessments with 227 subscriptions.
 - Frontend: `npm run build` under `src/Dashboard/frontend`
 - Always verify the rendered UI for UI changes; a successful build is not a browser test.
 - Measure latency from the app's SSE stream, not rendered pixels.
