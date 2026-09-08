@@ -410,6 +410,36 @@ using (var summary = JsonDocument.Parse(total))
 }
 Check(typeof(AzureQueryTools).GetMethod("TryReadCurrentMonthSpendFromBudgets", BindingFlags.NonPublic | BindingFlags.Instance) is null,
     "Live cost totals no longer use the budget fan-out shortcut");
+
+using var mgThrottledHttp = new HttpClient(new StubHandler(_ =>
+{
+    var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests) { Content = new StringContent("{\"error\":{\"code\":\"429\"}}") };
+    response.Headers.TryAddWithoutValidation("x-ms-ratelimit-microsoft.costmanagement-qpu-consumed", "1");
+    response.Headers.TryAddWithoutValidation("x-ms-ratelimit-microsoft.costmanagement-qpu-remaining", "QueriesPerHour:599,QueriesPerMin:59,QueriesPer10Sec:11");
+    response.Headers.TryAddWithoutValidation("x-ms-ratelimit-microsoft.costmanagement-entity-retry-after", "31");
+    return response;
+}));
+var mgToken = Token(Guid.NewGuid(), "mg-throttle");
+var mgTools = new AzureQueryTools(new UserTokens { AzureToken = mgToken }, mgThrottledHttp).Create().ToDictionary(tool => tool.Name);
+var mgThrottled = await Invoke(mgTools["QueryCostsAcrossSubscriptions"], new AIFunctionArguments
+{
+    ["subscriptionsJson"] = $"[{{\"id\":\"{Guid.NewGuid()}\",\"name\":\"Scope-A\"}}]",
+    ["managementGroupId"] = "synthetic-mg",
+    ["from"] = "2026-07-08",
+    ["to"] = "2026-09-08"
+});
+using (var mg = JsonDocument.Parse(mgThrottled))
+{
+    var quota = mg.RootElement.GetProperty("retry").GetProperty("rateLimitHeaders");
+    Check(mg.RootElement.GetProperty("status").GetInt32() == 429
+        && quota.GetProperty("x-ms-ratelimit-microsoft.costmanagement-entity-retry-after").GetString() == "31"
+        && quota.GetProperty("x-ms-ratelimit-microsoft.costmanagement-qpu-remaining").GetString()!.Contains("QueriesPer10Sec:11"),
+        "Management-group throttle keeps the quota diagnostics that identify which limit fired");
+}
+Check(mgTools["QueryCostsAcrossSubscriptions"].Description.Contains("CANNOT answer")
+    && mgTools["QueryAzure"].Description.Contains("SPIKE / TREND / REGION")
+    && mgTools["QueryAzure"].Description.Contains("ResourceLocation"),
+    "Spike, region and trend questions route away from the estate-total tool");
 var parseCost = typeof(AzureQueryTools).GetMethod("TryReadCost", BindingFlags.Static | BindingFlags.NonPublic)!;
 object?[] parseArguments = ["HTTP 200 OK\n" + JsonSerializer.Serialize(new { properties = new { nextLink = "https://management.azure.com/next" } }), 0d, null, null];
 Check(!(bool)parseCost.Invoke(null, parseArguments)!, "Unfinished cost page cannot become a total");

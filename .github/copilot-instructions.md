@@ -98,6 +98,7 @@ Before manually testing a fresh consent flow, revoke existing grants for the tes
 - Positive server retry hints remain tenant-shared. A headerless inferred fallback is isolated by hashed caller token so it does not block unrelated principals. Checking an existing cooldown never renews its expiry.
 - Every 429 includes a `finopsRetry` JSON object with retry time, delay source, and Azure-versus-local-cooldown source. Do not rely on text before the JSON body: the execution panel's JSON formatter omits it. Headerless cost-query throttles use a labelled 60-second fallback and no rapid retry; this is not a guarantee of quota availability.
 - Azure 429 results include bounded, explicitly allow-listed `finopsRetry.rateLimitHeaders` for diagnosing the exhausted quota. Never copy arbitrary response headers, authorization, or cookies into diagnostics. Local cooldowns have no new server headers.
+- Never character-truncate a throttle body: that severs `finopsRetry` and hides which quota fired. Tools attach the parsed object whole as `retry`, and every 429 that ends a call without retrying is logged with the full allow-listed header set and `x-ms-request-id`. Header presence is evidence — an absent `qpu-retry-after` alongside high `qpu-remaining` means a different bucket throttled the request. Cost query/forecast requests carry the fixed `ClientType`; unidentified callers share one exhausted client-type bucket, and a rejected 429 still consumes QPU, so retrying costs quota and gains nothing.
 - Successful cost-query responses are cached for five minutes under hashed caller-token + request keys, never across principals. Check before the tenant gate and again after acquiring it; a warm cache hit must not wait behind another user's request. Preserve fetch-time guidance and the HTTP-status-line + JSON-body contract.
 - Scope discovery follows subscription and management-group pages with same-host/path HTTPS continuation validation, a five-minute caller-token-isolated cache, and explicit incomplete flags. Use `FindSubscriptions` for bounded name/id resolution, never shell parsing of ARM inventory. Cache/prompt bounds are not proof that all scopes were discovered.
 - Evict faulted/incomplete discovery tasks. Cancellation of one waiter must not evict or cancel shared pending discovery for other callers. Cross-subscription cost cancellation propagates through discovery waiting, gate waits, retries, HTTP requests and the subscription loop.
@@ -106,6 +107,8 @@ Before manually testing a fresh consent flow, revoke existing grants for the tes
 
 Use `QueryCostsAcrossSubscriptions` exactly once for all-subscription totals.
 
+- It queries with `granularity: None` and no dataset filter, so it returns one undifferentiated total per subscription. It cannot express a daily series, a spike, a trend, or a `ResourceLocation`/service/meter/resource-group restriction. Route those questions to a single scoped `QueryAzure` Cost Management query with `granularity="Daily"` and/or `dataset.filter`; do not add granularity or filters to the estate-total tool, whose parsers sum every returned row.
+- Management-group scope is unsupported for Microsoft Customer Agreement and CSP accounts, and on Enterprise Agreement tenants it can still return `Management group ... does not have any valid subscriptions` when the group holds no subscriptions Cost Management can aggregate for the caller. That is a deterministic HTTP 400, not a throttle, so it must never be retried; fall back to subscription scope and surface `managementGroupError` instead of silently reporting reduced coverage. Management-group totals cover usage charges only and exclude reservations, savings plans and Marketplace purchases, so they are not interchangeable with billing-account or subscription totals.
 - Pass `subscriptionsJson='all'` to resolve all accessible scopes server-side; explicit arrays select a subset. Never treat a truncated connection-context array as the entire estate.
 - It tries one supplied, verified containing management-group query, then at most 20 sequential subscription queries. Larger estates need a supported aggregate scope or Cost Management exports. Paginated cost responses cannot be accepted as complete totals.
 - Management-group HTTP 400/403/404 permit the bounded child fallback; authentication, server and throttle failures stop immediately. Historical cost discovery retains all subscription states, prioritizing Enabled/Warned scopes without silently dropping disabled/deleted scopes.
@@ -200,6 +203,7 @@ The frontend must be built before backend startup so `wwwroot` exists when ASP.N
 - Backend: `dotnet build src/Dashboard/Dashboard.csproj --no-restore`
 - Large-tenant regression checks (no Azure calls): `dotnet run --project tests/LargeTenant.RegressionTests -p:CopilotSkipCliDownload=true`. Uses the actual Dashboard assembly with fake HTTP responses; covers retries, structured cooldown reporting, caching isolation, pagination, compact lookup, incomplete cost results, and bounded/cancellable Crawl assessments with 227 subscriptions.
 - Frontend: `npm run build` under `src/Dashboard/frontend`
+- Deployment build metadata (offline PowerShell mocks): `pwsh -NoLogo -NoProfile -File tests/build-metadata-regression.ps1`. Verifies the azd hook passes SHA/build/branch to ACR and rejects unresolved metadata before any Azure command.
 - Always verify the rendered UI for UI changes; a successful build is not a browser test.
 - Measure latency from the app's SSE stream, not rendered pixels.
 - Before every send, wait for the composer to be enabled and for the Stop button to be absent.
@@ -221,6 +225,18 @@ Maintainer CI workflows read deployment settings from GitHub repository variable
 Production OIDC must be branch-scoped to `main` and least-privileged: `AcrPush` on the target registry and `Website Contributor` on the target web app. App Service pulls images with its own managed identity and `AcrPull`.
 
 Do not deploy without explicit user instruction. When instructed, validate builds, diff, secrets, account context, workflow configuration, and target version before pushing.
+
+Every image build must explicitly pass `BUILD_SHA`, `BUILD_NUMBER`, and `BUILD_BRANCH`; Dockerfile defaults are not release metadata. VM and azd builds derive the number from `git rev-list --count HEAD`; refresh it after pulling/verifying the release checkout and require a positive integer. Use full Git history; GitHub Actions continues to use `github.run_number`. Commit counts are not globally unique build IDs, and rebuilding the same commit retains its number. Keep the timestamp-plus-SHA image tag unique. Verify `/api/version` reports the exact built number/SHA/branch after deployment; do not mask a stale image with App Service metadata overrides.
+
+### Azure VM Deployment Handoff
+
+When asked for deployment steps through the Azure Windows VM, follow the two-stage PowerShell format in `.github/prompts/deploy.prompt.md`. Providing steps is not permission to execute Azure deployment commands.
+
+- Reuse the existing VM checkout, intended branch and previously supplied, unambiguous target values. Do not default to a fresh temporary clone or ask for known names again. Real values belong only in chat/terminal commands, never tracked files; recover them from prior user context if necessary.
+- Provide short numbered sections and separate commands/blocks, with consistent variables and immediate native-command exit checks. Preserve dirty worktrees. Verify the exact published commit and keep local secrets/generated files out of the ACR build context.
+- First handoff: release/checks summary, Update the VM, Prepare the Build, Build in ACR. Use a unique timestamp-plus-SHA tag and explicit build metadata. Stop after the ACR command and request its result; leave the Web App unchanged. Do not include promotion steps yet unless the user explicitly asks for the full procedure.
+- After confirmed ACR build/push and packaged Linux collector validation: Set Deployment Variables using the same tag, Capture Rollback Image, Update the Web App, Restart Once if included, Verify. Preserve managed-identity image pull. Compare `/api/version` SHA/branch/build and `linuxFxVersion` to expected values, and request both outputs. Diagnose mismatches before any further rebuild/restart.
+- Report actual validation evidence and remaining security caveats, not claims copied from earlier releases. Distinguish native checks, ACR build success and verified serving state. Commit/push/deployment are separate authorized actions; verify remote publication and warn about CI triggers.
 
 ## Observability
 

@@ -10,7 +10,21 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot | Split-Path -Parent
 $dashboardDir = Join-Path $repoRoot 'src/Dashboard'
 
+$buildSha = git -C $repoRoot rev-parse --short=7 HEAD
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($buildSha)) {
+    throw 'Cannot resolve BUILD_SHA from the Git checkout.'
+}
+$buildNumber = git -C $repoRoot rev-list --count HEAD
+if ($LASTEXITCODE -ne 0 -or $buildNumber -notmatch '^[1-9][0-9]*$') {
+    throw 'Cannot resolve a positive BUILD_NUMBER from the Git checkout.'
+}
+$buildBranch = git -C $repoRoot branch --show-current
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($buildBranch)) {
+    throw 'Cannot resolve BUILD_BRANCH; deploy from the intended branch, not a detached checkout.'
+}
+
 Write-Host "`n=== azd postdeploy ===" -ForegroundColor Cyan
+Write-Host "  Build=$buildNumber SHA=$buildSha Branch=$buildBranch" -ForegroundColor Cyan
 
 $envValues = azd env get-values -o json 2>$null | ConvertFrom-Json -AsHashtable
 $acrName    = $envValues['AZURE_CONTAINER_REGISTRY_NAME']
@@ -51,6 +65,9 @@ try {
         --registry $acrName `
         --image $image `
         --file Dockerfile `
+        --build-arg "BUILD_SHA=$buildSha" `
+        --build-arg "BUILD_NUMBER=$buildNumber" `
+        --build-arg "BUILD_BRANCH=$buildBranch" `
         --output none `
         .
     if ($LASTEXITCODE -ne 0) {

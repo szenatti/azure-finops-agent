@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.AI;
 
@@ -49,7 +50,9 @@ Use standard ARM URL conventions; you know the resource providers and current ap
   /providers/Microsoft.Billing/billingAccounts/{billingAccountId}[/billingProfiles/{id}|/invoiceSections/{id}]
 Never bare /providers/Microsoft.CostManagement/... — that returns 400.
 
-COST MANAGEMENT QUERY: use api-version=" + AzureApiVersions.CostQuery + @". ALWAYS group by a real dimension (ServiceName, ResourceGroupName, MeterCategory). Do NOT add 'UsageDate' to the grouping array — it's a response column, not a dimension; use granularity=""Daily"" for per-day. Never request raw ungrouped cost data. For totals across all subscriptions, use QueryCostsAcrossSubscriptions with subscriptionsJson='all'; never fan out one query per subscription. Budget currentSpend is last evaluated spend, NOT live cost and NOT a service breakdown. GET /subscriptions returns a compact page; use FindSubscriptions for name resolution.
+COST MANAGEMENT QUERY: use api-version=" + AzureApiVersions.CostQuery + @". ALWAYS group by a real dimension (ServiceName, ResourceGroupName, MeterCategory). Do NOT add 'UsageDate' to the grouping array — it's a response column, not a dimension; use granularity=""Daily"" for per-day. Never request raw ungrouped cost data. For a plain total across all subscriptions, use QueryCostsAcrossSubscriptions with subscriptionsJson='all'; never fan out one query per subscription. Budget currentSpend is last evaluated spend, NOT live cost and NOT a service breakdown. GET /subscriptions returns a compact page; use FindSubscriptions for name resolution.
+SPIKE / TREND / REGION / SERVICE QUESTIONS: do NOT use QueryCostsAcrossSubscriptions — it returns one undifferentiated total per subscription. Issue ONE query here at the narrowest scope that covers the question, with granularity=""Daily"" for a per-day series and dataset.filter for dimensions. Region example: {""dimensions"":{""name"":""ResourceLocation"",""operator"":""In"",""values"":[""East US"",""West US 2""]}}. Grouping accepts at most 2 dimensions. ResourceLocation values are Cost Management's own labels; if a region filter returns no rows, re-run grouped by ResourceLocation to read the actual values instead of guessing, and report zero rows as unknown, never as zero spend.
+MANAGEMENT-GROUP SCOPE: unsupported for Microsoft Customer Agreement and CSP accounts. Even on an Enterprise Agreement it can return 'Management group ... does not have any valid subscriptions' when the group holds no subscriptions Cost Management can aggregate for this caller. That is a deterministic HTTP 400, never a throttle: do not retry it, fall back to subscription scope and say the aggregate was unavailable. Management-group totals cover usage charges only and EXCLUDE reservations, savings plans and Marketplace purchases, so they are not comparable with billing-account totals; state that exclusion whenever you report one.
 OTHER COST API VERSIONS: forecast=" + AzureApiVersions.CostForecast + "; exports=" + AzureApiVersions.CostExports + "; alerts=" + AzureApiVersions.CostAlerts + "; scheduledActions=" + AzureApiVersions.ScheduledActions + "; Consumption budgets=" + AzureApiVersions.Budgets + @". Each endpoint has its own supported version; do not invent a newer one. Preserve versions explicitly requested for controlled comparisons.
 
 THROTTLING: Cost Management /query and /forecast are aggressively throttled per-tenant. Interactive queries make at most one short retry; other transient calls retain the standard retry policy. Do NOT call multiple CostManagement endpoints in parallel from the same turn — Resource Graph and Advisor parallelize fine. If a call still returns HTTP 429, do not make another Cost Management call in the same turn; report the throttle and offer to retry later.
@@ -66,9 +69,10 @@ CONSUMPTION DEPRECATIONS: usageDetails → use Microsoft.CostManagement/generate
 
 For public retail pricing use https://prices.azure.com (no auth) with ?$filter=armRegionName eq '...' and serviceName eq '...' and armSkuName eq '...'&$top=20.");
 
-        yield return AIFunctionFactory.Create(QueryCostsAcrossSubscriptions, "QueryCostsAcrossSubscriptions", @"Gets Cost Management totals, coverage counts and up to 50 subscription details in ONE agent tool call. Use this for any cost request spanning all connected subscriptions; never loop QueryAzure yourself. Cached results may be up to five minutes old and Azure cost ingestion may lag usage.
+        yield return AIFunctionFactory.Create(QueryCostsAcrossSubscriptions, "QueryCostsAcrossSubscriptions", @"Gets a PLAIN COST TOTAL per subscription, plus coverage counts and up to 50 subscription details, in ONE agent tool call. Use this only when the question is 'how much did we spend' across many subscriptions; never loop QueryAzure yourself. Cached results may be up to five minutes old and Azure cost ingestion may lag usage.
+LIMITS — this tool queries with granularity 'None' and NO dimension filter, so it returns a single number per subscription for the whole window. It CANNOT answer questions about daily series, spikes, trends, regions, services, meters or resource groups. For any of those, issue ONE scoped QueryAzure Cost Management query with granularity='Daily' and/or dataset.filter instead of calling this tool.
 Input subscriptionsJson: 'all' for all accessible subscriptions (discovered by the host, never copy a truncated context list), or an explicit JSON array of selected {id,name} scopes. Input managementGroupId: an optional verified containing management group. Dates are yyyy-MM-dd; `to` is the exclusive end date.
-    Uses Cost Management only, never budget evaluations as a live-cost substitute. It tries one supplied management-group aggregate, then at most 20 sequential subscription queries per call. Stops immediately on throttling; reports partial coverage and unattempted scopes, never a complete total for partial data. For larger estates use a supported aggregate scope or Cost Management exports. Never call this tool twice in one turn after a 429.");
+    Uses Cost Management only, never budget evaluations as a live-cost substitute. It tries one supplied management-group aggregate, then at most 20 sequential subscription queries per call. Stops immediately on throttling; reports partial coverage and unattempted scopes, never a complete total for partial data. On HTTP 429 the `retry` field names the Azure quota that fired — report it verbatim. For larger estates use a supported aggregate scope or Cost Management exports. Never call this tool twice in one turn after a 429.");
 
 
         yield return AIFunctionFactory.Create(BulkAzureRequest, "BulkAzureRequest", @"Executes MANY Azure ARM requests in ONE tool call, in parallel, server-side. Use this whenever you would otherwise loop QueryAzure for the same kind of operation across multiple resources (bulk tagging, cleanup discovery, autoshutdown rollout, budget rollout across subs, multi-resource right-sizing, RBAC fan-out, etc.).
@@ -233,6 +237,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
         });
 
         Dictionary<string, CostScopeResult>? aggregateResults = null;
+        string? managementGroupError = null;
 
         // Prefer one aggregate call. An accessible management group is not
         // guaranteed to contain the delegated subscriptions, so only 400/403/404
@@ -290,8 +295,13 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
                         attempted = 1,
                         unattempted = scopes.Count,
                         subscriptionCount = scopes.Count,
-                        detail = FirstLineAndBody(mgResponse, 500)
+                        detail = FirstLineAndBody(mgResponse, 500),
+                        retry = ThrottleDiagnostics(mgResponse)
                     });
+                // A silent fallback hides deterministic scope errors such as
+                // "does not have any valid subscriptions", which never recover on retry.
+                if (mgStatus is 400 or 403 or 404)
+                    managementGroupError = FirstLineAndBody(mgResponse, 300);
             }
         }
 
@@ -300,6 +310,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
         var resultsById = aggregateResults;
         var remainingScopes = scopes.Where(s => !resultsById.ContainsKey(s.Id)).ToList();
         var throttled = false;
+        JsonNode? throttleDiagnostics = null;
 
         for (var i = 0; i < remainingScopes.Count; i++)
         {
@@ -335,6 +346,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
             if (status == 429)
             {
                 throttled = true;
+                throttleDiagnostics = ThrottleDiagnostics(response);
                 for (var j = i + 1; j < remainingScopes.Count; j++)
                 {
                     var unattempted = remainingScopes[j];
@@ -351,7 +363,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
         }
 
         var source = reusedAggregateResults ? "managementGroup+subscriptions" : "subscriptions";
-        return BuildCostResponse(source, scopes, resultsById, throttled);
+        return BuildCostResponse(source, scopes, resultsById, throttled, throttleDiagnostics, managementGroupError);
     }
 
     internal static BudgetSpend ReadUnfilteredBudgetSpend(
@@ -526,7 +538,9 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
         string source,
         IReadOnlyList<(string Id, string Name)> scopes,
         IReadOnlyDictionary<string, CostScopeResult> resultsById,
-        bool throttled)
+        bool throttled,
+        JsonNode? retry = null,
+        string? managementGroupError = null)
     {
         var orderedResults = scopes.Select(scope =>
             resultsById.TryGetValue(scope.Id, out var result)
@@ -551,6 +565,8 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
             complete,
             source,
             throttled,
+            retry,
+            managementGroupError,
             subscriptionCount = scopes.Count,
             succeeded,
             noData = orderedResults.Count(result => result.Status == 200 && result.Cost is null && result.Error == NoCostRows),
@@ -655,6 +671,21 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
 
     private static string FirstLineAndBody(string response, int maxChars) =>
         response.Length <= maxChars ? response : response[..maxChars];
+
+    // Returned whole, never truncated: this block names the Azure quota that fired.
+    private static JsonNode? ThrottleDiagnostics(string response)
+    {
+        try
+        {
+            return JsonNode.Parse(ResponseBody(response)) is JsonObject root
+                ? root["finopsRetry"]?.DeepClone()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
 
     internal sealed record BudgetSpend(
         string SubscriptionId,

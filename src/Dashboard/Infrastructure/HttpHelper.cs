@@ -304,10 +304,18 @@ public static class HttpHelper
                     : MaxRetryWaitSeconds;
                 if (attempt == maxAttempts - 1 || waitSeconds > waitBudget)
                 {
-                    if (isThrottle && report is not null)
+                    if (isThrottle)
                     {
-                        try { await report(attempt + 1, waitSeconds, url, telemetryPrefix, status); }
-                        catch (Exception exception) { Logger?.LogWarning(exception, "SSE cooldown emit failed for {Tool}", telemetryPrefix); }
+                        // Survives the caller-side truncation that hides which Azure quota fired.
+                        Logger?.LogWarning("HTTP throttled {Tool} waitSec={Wait:F1} delaySource={Source} requestId={RequestId} rateLimit={RateLimit} url={Url}",
+                            telemetryPrefix, waitSeconds, serverDelay > 0 ? "server" : "fallback",
+                            res.Headers.TryGetValues("x-ms-request-id", out var throttleIds) ? throttleIds.FirstOrDefault() : null,
+                            JsonSerializer.Serialize(ReadRateLimitHeaders(res)), url);
+                        if (report is not null)
+                        {
+                            try { await report(attempt + 1, waitSeconds, url, telemetryPrefix, status); }
+                            catch (Exception exception) { Logger?.LogWarning(exception, "SSE cooldown emit failed for {Tool}", telemetryPrefix); }
+                        }
                     }
                     break;
                 }
