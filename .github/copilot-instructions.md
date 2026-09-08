@@ -91,6 +91,7 @@ Before manually testing a fresh consent flow, revoke existing grants for the tes
 - Never issue multiple Cost Management query calls in parallel. After a final 429, stop querying that service for the turn.
 - Cost query/forecast requests share a tenant-keyed semaphore, one-second spacing, and cooldown across users, turns, and scheduled jobs in the same process. Tenant claims are used only for throttle bucketing, never authorization. Honor the longest positive standard or Cost Management/Consumption retry hint; return long cooldowns instead of shortening them. Multi-instance hosting needs distributed rate/cooldown coordination.
 - Every 429 includes a `finopsRetry` JSON object with retry time, delay source, and Azure-versus-local-cooldown source. Do not rely on text before the JSON body: the execution panel's JSON formatter omits it. Headerless cost-query throttles use a labelled 60-second fallback and no rapid retry; this is not a guarantee of quota availability.
+- Azure 429 results include bounded, explicitly allow-listed `finopsRetry.rateLimitHeaders` for diagnosing the exhausted quota. Never copy arbitrary response headers, authorization, or cookies into diagnostics. Local cooldowns have no new server headers.
 - Successful cost-query responses are cached for five minutes under hashed caller-token + request keys, never across principals. Preserve fetch-time guidance and the HTTP-status-line + JSON-body contract.
 - Scope discovery follows subscription and management-group pages with same-host/path HTTPS continuation validation, a five-minute caller-token-isolated cache, and explicit incomplete flags. Use `FindSubscriptions` for bounded name/id resolution, never shell parsing of ARM inventory. Cache/prompt bounds are not proof that all scopes were discovered.
 
@@ -213,6 +214,10 @@ Production OIDC must be branch-scoped to `main` and least-privileged: `AcrPush` 
 Do not deploy without explicit user instruction. When instructed, validate builds, diff, secrets, account context, workflow configuration, and target version before pushing.
 
 ## Observability
+
+The collector caps trace resource, span, and span-event string attributes at 4096 before Azure Monitor export, below its 8192-character property limit. This affects telemetry copies only, not model input, tool results, or persisted chat. Numeric fields and span identity/timing/status remain intact. Truncated JSON attributes are diagnostic excerpts, not complete documents; truncation is not secret redaction. Keep the transform before batching and validate it with the collector release pinned in the Dockerfile.
+
+The image build runs `otelcol validate` against the exact Linux collector and configuration it packages, using a generated test instrumentation key and loopback endpoint. This checks configuration without starting the collector or contacting Azure. Do not bypass this build gate or supply real credentials to it.
 
 Discover Application Insights and Log Analytics identifiers from `azd env get-values`, Azure Resource Graph, or the deployed resource group. Never hardcode an application ID, workspace ID, subscription, or resource group in prompts or instructions.
 

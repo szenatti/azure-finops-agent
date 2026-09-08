@@ -101,6 +101,11 @@ using var throttledHttp = new HttpClient(new StubHandler(_ =>
     throttledCalls++;
     var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests) { Content = new StringContent("{\"error\":{\"code\":\"429\"}}") };
     response.Headers.TryAddWithoutValidation("x-ms-ratelimit-microsoft.consumption-retry-after", "120");
+    response.Headers.TryAddWithoutValidation("x-ms-ratelimit-microsoft.costmanagement-entity-retry-after", "31");
+    response.Headers.TryAddWithoutValidation("x-ms-ratelimit-microsoft.costmanagement-qpu-remaining", new string('0', 1000));
+    response.Headers.TryAddWithoutValidation("Set-Cookie", "synthetic-cookie=never-export");
+    response.Headers.TryAddWithoutValidation("Authorization", "Bearer synthetic-never-export");
+    response.Headers.TryAddWithoutValidation("x-ms-unrelated-header", "never-export");
     return response;
 }));
 var throttledToken = Token(Guid.NewGuid(), "throttled");
@@ -114,10 +119,22 @@ using (var response = JsonDocument.Parse(throttledResult[(throttledResult.IndexO
     var retry = response.RootElement.GetProperty("finopsRetry");
     Check(retry.GetProperty("retryAfterSeconds").GetDouble() == 120 && retry.GetProperty("source").GetString() == "azure"
         && retry.GetProperty("delaySource").GetString() == "server", "Server cooldown is visible in JSON-rendered tool output");
+    var rateHeaders = retry.GetProperty("rateLimitHeaders");
+    Check(rateHeaders.GetProperty("x-ms-ratelimit-microsoft.consumption-retry-after").GetString() == "120"
+        && rateHeaders.GetProperty("x-ms-ratelimit-microsoft.costmanagement-entity-retry-after").GetString() == "31",
+        "Throttle result identifies the contributing rate-limit headers without changing the longest delay");
+    Check(rateHeaders.GetProperty("x-ms-ratelimit-microsoft.costmanagement-qpu-remaining").GetString()!.Length == 256,
+        "Rate-limit diagnostics have bounded values");
+    Check(rateHeaders.EnumerateObject().Count() == 3 && !throttledResult.Contains("never-export"),
+        "Rate-limit diagnostics exclude credentials, cookies and unrelated headers");
 }
 using (var response = JsonDocument.Parse(subsequent[(subsequent.IndexOf('\n') + 1)..]))
+{
     Check(response.RootElement.GetProperty("finopsRetry").GetProperty("source").GetString() == "localCooldown",
         "Execution output distinguishes a local cooldown from an Azure rejection");
+    Check(!response.RootElement.GetProperty("finopsRetry").GetProperty("rateLimitHeaders").EnumerateObject().Any(),
+        "Local cooldown does not invent Azure response headers");
+}
 var headerlessCalls = 0;
 using (var headerlessHttp = new HttpClient(new StubHandler(_ =>
 {

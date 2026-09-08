@@ -353,7 +353,8 @@ public static class HttpHelper
         if ((int)res.StatusCode == 429)
             return FormatThrottleResponse(responseBody, finalRetrySeconds, "azure",
                 ReadServerRetryAfterSeconds(res) > 0 ? "server" : "fallback",
-                res.Headers.TryGetValues("x-ms-request-id", out var ids) ? ids.FirstOrDefault() : null);
+                res.Headers.TryGetValues("x-ms-request-id", out var ids) ? ids.FirstOrDefault() : null,
+                ReadRateLimitHeaders(res));
 
         var result = $"HTTP {(int)res.StatusCode} {res.StatusCode}";
         if (cacheKey is not null && res.IsSuccessStatusCode)
@@ -409,7 +410,8 @@ public static class HttpHelper
         return result;
     }
 
-    private static string FormatThrottleResponse(string body, double seconds, string source, string delaySource, string? requestId = null)
+    private static string FormatThrottleResponse(string body, double seconds, string source, string delaySource,
+        string? requestId = null, IReadOnlyDictionary<string, string>? rateLimitHeaders = null)
     {
         JsonObject root;
         try { root = JsonNode.Parse(body) as JsonObject ?? new JsonObject(); }
@@ -426,9 +428,36 @@ public static class HttpHelper
             ["retryAtUtc"] = retryAt.ToString("o"),
             ["delaySource"] = delaySource,
             ["requestId"] = requestId,
+            ["rateLimitHeaders"] = JsonSerializer.SerializeToNode(rateLimitHeaders ?? new Dictionary<string, string>()),
             ["guidance"] = "Do not issue more cost queries this turn. Retry after retryAtUtc; that time is not a guarantee Azure quota will be available."
         };
         return $"HTTP 429 TooManyRequests; Retry-After: {Math.Ceiling(seconds):F0} seconds.\n{root.ToJsonString()}";
+    }
+
+    private static IReadOnlyDictionary<string, string> ReadRateLimitHeaders(HttpResponseMessage response)
+    {
+        string[] names =
+        [
+            "Retry-After",
+            "x-ms-ratelimit-microsoft.consumption-retry-after",
+            "x-ms-ratelimit-microsoft.costmanagement-qpu-retry-after",
+            "x-ms-ratelimit-microsoft.costmanagement-qpu-consumed",
+            "x-ms-ratelimit-microsoft.costmanagement-qpu-remaining",
+            "x-ms-ratelimit-microsoft.costmanagement-entity-retry-after",
+            "x-ms-ratelimit-microsoft.costmanagement-entity-remaining",
+            "x-ms-ratelimit-microsoft.costmanagement-tenant-retry-after",
+            "x-ms-ratelimit-microsoft.costmanagement-tenant-remaining",
+            "x-ms-ratelimit-microsoft.costmanagement-clienttype-retry-after",
+            "x-ms-ratelimit-microsoft.costmanagement-clienttype-remaining"
+        ];
+        var headers = new Dictionary<string, string>();
+        foreach (var name in names)
+        {
+            if (!response.Headers.TryGetValues(name, out var values)) continue;
+            var value = string.Join(", ", values.Take(4).Select(item => item.Length > 256 ? item[..256] : item));
+            headers[name] = value.Length > 256 ? value[..256] : value;
+        }
+        return headers;
     }
 
     private static double ReadServerRetryAfterSeconds(HttpResponseMessage res)
