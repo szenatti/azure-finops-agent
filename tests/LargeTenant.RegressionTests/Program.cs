@@ -677,6 +677,71 @@ using (var neverCalled = new HttpClient(new StubHandler(_ => throw new InvalidOp
     catch (OperationCanceledException) { cancelledCorrectly = true; }
     Check(cancelledCorrectly, "Cancelled evidence request does not reach HTTP");
 }
+
+var anomalyToday = DateTime.UtcNow.Date;
+var anomalyDates = Enumerable.Range(1, 21).Select(offset => anomalyToday.AddDays(-offset)).Reverse().ToArray();
+var anomalyBodies = new System.Collections.Concurrent.ConcurrentQueue<string>();
+using (var anomalyHttp = new HttpClient(new StubHandler(request =>
+{
+    var body = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+    anomalyBodies.Enqueue(body);
+    // Grouped requests are the breakdown; the ungrouped one is the daily baseline.
+    if (body.Contains("\"grouping\""))
+        return JsonResponse(new
+        {
+            properties = new
+            {
+                nextLink = (string?)null,
+                columns = new[] { new { name = "Cost" }, new { name = "UsageDate" }, new { name = "ServiceName" }, new { name = "Currency" } },
+                rows = new object[]
+                {
+                    new object[] { 700.0, int.Parse(anomalyDates[^2].ToString("yyyyMMdd")), "Virtual Machines", "AUD" },
+                    new object[] { 200.0, int.Parse(anomalyDates[^2].ToString("yyyyMMdd")), "SQL Database", "AUD" },
+                    new object[] { 650.0, int.Parse(anomalyDates[^1].ToString("yyyyMMdd")), "Virtual Machines", "AUD" },
+                    new object[] { 250.0, int.Parse(anomalyDates[^1].ToString("yyyyMMdd")), "Azure Cosmos DB", "AUD" }
+                }
+            }
+        });
+
+    var daily = anomalyDates
+        .Select((date, index) => new object[]
+        {
+            index >= anomalyDates.Length - 2 ? 900.0 : 100.0 + (index % 2) * 10.0,
+            int.Parse(date.ToString("yyyyMMdd")), "AUD"
+        })
+        .Append(new object[] { 5.0, int.Parse(anomalyToday.ToString("yyyyMMdd")), "AUD" })
+        .ToArray();
+    return JsonResponse(new
+    {
+        properties = new
+        {
+            nextLink = (string?)null,
+            columns = new[] { new { name = "Cost" }, new { name = "UsageDate" }, new { name = "Currency" } },
+            rows = daily
+        }
+    });
+})))
+{
+    var anomalyTools = new AnomalyTools(new UserTokens { AzureToken = Token(Guid.NewGuid(), "anomaly") }, anomalyHttp)
+        .Create().ToDictionary(tool => tool.Name);
+    var detected = await Invoke(anomalyTools["DetectCostAnomalies"], new AIFunctionArguments
+    {
+        ["subscriptionId"] = Guid.NewGuid().ToString(), ["days"] = 30
+    });
+    using var anomalyJson = JsonDocument.Parse(detected);
+    var found = anomalyJson.RootElement.GetProperty("anomalies").EnumerateArray().ToArray();
+    var todayStamp = anomalyToday.ToString("yyyy-MM-dd");
+
+    Check(anomalyBodies.Count == 2,
+        "Anomaly breakdowns use one range query instead of one Cost Management call per anomalous day");
+    Check(found.Length == 2 && found.All(item => item.GetProperty("date").GetString() != todayStamp)
+        && anomalyJson.RootElement.GetProperty("window").GetProperty("to").GetString() != todayStamp,
+        "The incomplete current UTC day is excluded instead of scoring as a large artificial drop");
+    Check(found.All(item => item.GetProperty("top_contributors").ValueKind == JsonValueKind.Array
+        && item.GetProperty("top_contributors").GetArrayLength() == 2),
+        "Every anomalous day still receives its own contributor breakdown from the single query");
+}
+
 Console.WriteLine("All large-tenant regression checks passed.");
 
 static void Check(bool condition, string name)

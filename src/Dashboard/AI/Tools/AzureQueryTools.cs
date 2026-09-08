@@ -57,7 +57,7 @@ OTHER COST API VERSIONS: forecast=" + AzureApiVersions.CostForecast + "; exports
 
 THROTTLING: Cost Management /query and /forecast are aggressively throttled per-tenant. Interactive queries make at most one short retry; other transient calls retain the standard retry policy. Do NOT call multiple CostManagement endpoints in parallel from the same turn — Resource Graph and Advisor parallelize fine. If a call still returns HTTP 429, do not make another Cost Management call in the same turn; report the throttle and offer to retry later.
 
-RESOURCE GRAPH (POST /providers/Microsoft.ResourceGraph/resources): always use 'project' to limit columns and 'top N' to limit rows. Use one pipeline; Azure Resource Graph does not accept multi-statement `let ...; let ...;` queries.
+RESOURCE GRAPH (POST /providers/Microsoft.ResourceGraph/resources): always use 'project' to limit columns and 'take N' to limit rows — bare 'top N' is a ParserFailure, because Kusto requires 'top N by <column>'. Use one pipeline; Azure Resource Graph does not accept multi-statement `let ...; let ...;` queries.
 
 SPOT QUOTA: Spot/low-priority VM quota is a SINGLE regional bucket called 'lowPriorityCores' (NOT per VM family) — covers ALL spot VMs including H100/A100. Standard quotas are per-family ('standardNDSH100v5Family', 'StandardNCadsH100v5Family'). Microsoft.Quota requires RP registration (PUT /subscriptions/{subId}/providers/Microsoft.Quota/register) — fall back to GET .../Microsoft.Compute/locations/{region}/usages if not registered.
 

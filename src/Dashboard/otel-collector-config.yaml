@@ -5,7 +5,7 @@
 # Why a sidecar collector?
 #   - The Copilot CLI subprocess emits OTLP, not Azure Monitor's proprietary
 #     wire format. App Insights does not accept raw OTLP, so we need a
-#     translator. The "azuremonitor" exporter in opentelemetry-collector-contrib
+#     translator. The "azure_monitor" exporter in opentelemetry-collector-contrib
 #     is the supported bridge.
 #   - It also acts as an out-of-process batch buffer so spans survive .NET
 #     SSE-stream cancellations and graceful container restarts.
@@ -54,7 +54,8 @@ processors:
         - 'attributes["url.path"] == "/wp-admin/install.php"'
 
 exporters:
-  azuremonitor:
+  # Renamed from the deprecated "azuremonitor" alias, which warns on every start in 0.160.0.
+  azure_monitor:
     connection_string: ${env:APPLICATIONINSIGHTS_CONNECTION_STRING}
   # Tiny stdout exporter for local debugging (only enabled when OTEL_DEBUG=1).
   debug:
@@ -68,12 +69,12 @@ service:
     traces:
       receivers: [otlp]
       processors: [filter/drop_noise, transform/limit_attributes, batch]
-      exporters: [azuremonitor]
+      exporters: [azure_monitor]
     metrics:
       receivers: [otlp]
       processors: [batch]
-      exporters: [azuremonitor]
+      exporters: [azure_monitor]
     logs:
       receivers: [otlp]
       processors: [transform/limit_attributes, batch]
-      exporters: [azuremonitor]
+      exporters: [azure_monitor]

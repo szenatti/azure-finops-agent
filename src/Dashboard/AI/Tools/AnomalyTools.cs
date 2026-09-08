@@ -15,8 +15,15 @@ namespace AzureFinOps.Dashboard.AI.Tools;
 public class AnomalyTools
 {
     private readonly UserTokens _tokens;
+    private readonly HttpClient? _http;
 
-    public AnomalyTools(UserTokens tokens) => _tokens = tokens;
+    public AnomalyTools(UserTokens tokens) : this(tokens, null) { }
+
+    internal AnomalyTools(UserTokens tokens, HttpClient? http)
+    {
+        _tokens = tokens;
+        _http = http;
+    }
 
     public IEnumerable<AIFunction> Create()
     {
@@ -25,7 +32,7 @@ public class AnomalyTools
 
 Use when user asks 'why did costs spike?', 'are there anomalies?', 'investigate cost increase', etc.
 
-Returns JSON: baseline_mean, baseline_stddev, threshold (mean + 2*stddev), anomalies[] (date, magnitude, grouping breakdown), summary.
+Returns JSON: baseline_mean, baseline_stddev, threshold (mean + 2*stddev), anomalies[] (date, magnitude, grouping breakdown), summary. The current UTC day is excluded because cost ingestion lags and a partial day reads as a large artificial drop.
 
 After calling, drill into each anomalous date with QueryAzure (Cost Mgmt /query grouped by ResourceGroupName or ServiceName for that date range) to find root cause.");
     }
@@ -47,7 +54,9 @@ After calling, drill into each anomalous date with QueryAzure (Cost Mgmt /query 
         zThreshold = Math.Clamp(zThreshold, 1.0, 5.0);
         if (string.IsNullOrWhiteSpace(groupBy)) groupBy = "ServiceName";
 
-        var to = DateTime.UtcNow.Date;
+        // Cost ingestion lags, so the current UTC day is always partial and would
+        // otherwise score as a large artificial drop.
+        var to = DateTime.UtcNow.Date.AddDays(-1);
         var from = to.AddDays(-days);
 
         // Cost Management daily query (no grouping — total daily cost for baseline)
@@ -68,9 +77,9 @@ After calling, drill into each anomalous date with QueryAzure (Cost Mgmt /query 
         activity?.SetTag("anomaly.days", days);
         activity?.SetTag("anomaly.z_threshold", zThreshold);
 
-        var dailyUrl = $"https://management.azure.com/subscriptions/{subscriptionId}/providers/Microsoft.CostManagement/query?api-version=2026-08-01";
-        var dailyResp = await HttpHelper.SendWithRetryAsync(
-            dailyUrl, token, activity, "anomaly.daily",
+        var dailyUrl = $"https://management.azure.com/subscriptions/{subscriptionId}/providers/Microsoft.CostManagement/query?api-version={AzureApiVersions.CostQuery}";
+        var dailyResp = await HttpHelper.SendCoreAsync(
+            _http, dailyUrl, token, activity, "anomaly.daily",
             method: HttpMethod.Post, jsonBody: dailyBody);
 
         if (!dailyResp.StartsWith("HTTP 200"))
@@ -83,7 +92,8 @@ After calling, drill into each anomalous date with QueryAzure (Cost Mgmt /query 
 
         var (series, parseErr) = ParseDailyCosts(dailyJson);
         if (parseErr is not null) return $"Error parsing cost response: {parseErr}\nRaw: {dailyJson[..Math.Min(dailyJson.Length, 800)]}";
-        if (series.Count < 7) return $"Not enough data to baseline (got {series.Count} days, need >=7). Try a wider 'days' window.";
+        series = series.Where(p => p.Date <= to).ToList();
+        if (series.Count < 7) return $"Not enough data to baseline (got {series.Count} complete days, need >=7). Try a wider 'days' window.";
 
         // Compute rolling baseline: use first (days-7) days as baseline, last 7 as detection window
         var detectionDays = Math.Min(7, series.Count / 3);
@@ -96,10 +106,9 @@ After calling, drill into each anomalous date with QueryAzure (Cost Mgmt /query 
         var threshold = mean + zThreshold * stddev;
         var lowThreshold = Math.Max(0, mean - zThreshold * stddev);
 
-        // Build the list of anomalous days first (cheap, in-memory), then
-        // fan out the per-day cost-breakdown drilldowns in parallel. Each
-        // drilldown is an independent Cost Management query; serialising
-        // them was needlessly multiplying wall time by N anomalies.
+        // Build the list of anomalous days first (cheap, in-memory), then fetch
+        // every breakdown in ONE range query. Fanning out a Cost Management call
+        // per anomaly tripped the tenant throttle and lost most of the breakdowns.
         var anomalyCandidates = new List<(DateTime Date, double Cost, double Z)>();
         foreach (var p in detection)
         {
@@ -107,23 +116,23 @@ After calling, drill into each anomalous date with QueryAzure (Cost Mgmt /query 
             var z = (p.Cost - mean) / stddev;
             if (Math.Abs(z) >= zThreshold) anomalyCandidates.Add((p.Date, p.Cost, z));
         }
-        var drilldownTasks = anomalyCandidates.Select(async c =>
+
+        var breakdowns = new Dictionary<DateTime, List<object>>();
+        string? breakdownError = null;
+        if (anomalyCandidates.Count > 0)
+            (breakdowns, breakdownError) = await GetBreakdownsForRange(
+                _http, token, subscriptionId, anomalyCandidates.Min(c => c.Date), anomalyCandidates.Max(c => c.Date), groupBy, activity);
+
+        var anomalies = anomalyCandidates.Select(c => (object)new
         {
-            // Pass null activity — Activity is not safe for concurrent SetTag
-            // writers, and these drilldowns run in parallel. Each call still
-            // gets its own ActivitySource span inside HttpHelper.
-            try { return (c, Breakdown: (object)await GetBreakdownForDay(token, subscriptionId, c.Date, groupBy, activity: null)); }
-            catch (Exception ex) { return (c, Breakdown: new { error = ex.Message }); }
-        }).ToArray();
-        var drilldowns = await Task.WhenAll(drilldownTasks);
-        var anomalies = drilldowns.Select(d => (object)new
-        {
-            date = d.c.Date.ToString("yyyy-MM-dd"),
-            cost = Math.Round(d.c.Cost, 2),
-            z_score = Math.Round(d.c.Z, 2),
-            deviation_pct = mean > 0.01 ? Math.Round((d.c.Cost - mean) / mean * 100, 1) : 0,
-            direction = d.c.Z > 0 ? "spike" : "drop",
-            top_contributors = d.Breakdown
+            date = c.Date.ToString("yyyy-MM-dd"),
+            cost = Math.Round(c.Cost, 2),
+            z_score = Math.Round(c.Z, 2),
+            deviation_pct = mean > 0.01 ? Math.Round((c.Cost - mean) / mean * 100, 1) : 0,
+            direction = c.Z > 0 ? "spike" : "drop",
+            top_contributors = breakdowns.TryGetValue(c.Date, out var rows)
+                ? rows
+                : (object)new { error = "no breakdown available", detail = breakdownError ?? "no rows returned for this date" }
         }).ToList();
 
         var result = new
@@ -186,26 +195,26 @@ After calling, drill into each anomalous date with QueryAzure (Cost Mgmt /query 
         }
     }
 
-    private static async Task<object> GetBreakdownForDay(string token, string subId, DateTime day, string groupBy, System.Diagnostics.Activity? activity)
+    private static async Task<(Dictionary<DateTime, List<object>> ByDate, string? Error)> GetBreakdownsForRange(
+        HttpClient? http, string token, string subId, DateTime from, DateTime to, string groupBy, System.Diagnostics.Activity? activity)
     {
         var body = JsonSerializer.Serialize(new
         {
             type = "ActualCost",
             timeframe = "Custom",
-            timePeriod = new { from = day.ToString("yyyy-MM-dd"), to = day.ToString("yyyy-MM-dd") },
+            timePeriod = new { from = from.ToString("yyyy-MM-dd"), to = to.ToString("yyyy-MM-dd") },
             dataset = new
             {
-                granularity = "None",
+                granularity = "Daily",
                 aggregation = new { totalCost = new { name = "Cost", function = "Sum" } },
-                grouping = new[] { new { type = "Dimension", name = groupBy } },
-                sorting = new[] { new { direction = "descending", name = "Cost" } }
+                grouping = new[] { new { type = "Dimension", name = groupBy } }
             }
         });
-        var url = $"https://management.azure.com/subscriptions/{subId}/providers/Microsoft.CostManagement/query?api-version=2026-08-01";
-        var resp = await HttpHelper.SendWithRetryAsync(url, token, activity, "anomaly.breakdown",
+        var url = $"https://management.azure.com/subscriptions/{subId}/providers/Microsoft.CostManagement/query?api-version={AzureApiVersions.CostQuery}";
+        var resp = await HttpHelper.SendCoreAsync(http, url, token, activity, "anomaly.breakdown",
             method: HttpMethod.Post, jsonBody: body);
 
-        if (!resp.StartsWith("HTTP 200")) return new { error = "could not fetch breakdown", detail = resp[..Math.Min(resp.Length, 300)] };
+        if (!resp.StartsWith("HTTP 200")) return (new(), resp[..Math.Min(resp.Length, 300)]);
 
         var json = resp[(resp.IndexOf('\n') + 1)..];
         if (json.StartsWith("Current UTC time:")) json = json[(json.IndexOf('\n') + 1)..];
@@ -213,16 +222,34 @@ After calling, drill into each anomalous date with QueryAzure (Cost Mgmt /query 
         try
         {
             using var doc = JsonDocument.Parse(json);
-            var rows = doc.RootElement.GetProperty("properties").GetProperty("rows");
-            var top = new List<object>();
-            int n = 0;
-            foreach (var row in rows.EnumerateArray())
+            var props = doc.RootElement.GetProperty("properties");
+            var columns = props.GetProperty("columns").EnumerateArray()
+                .Select((c, i) => (Name: c.GetProperty("name").GetString() ?? "", Index: i))
+                .ToDictionary(x => x.Name, x => x.Index, StringComparer.OrdinalIgnoreCase);
+            var costIdx = columns.TryGetValue("Cost", out var ci) ? ci : columns["PreTaxCost"];
+            var dateIdx = columns["UsageDate"];
+            var nameIdx = columns[groupBy];
+
+            var grouped = new Dictionary<DateTime, List<(string Name, double Cost)>>();
+            foreach (var row in props.GetProperty("rows").EnumerateArray())
             {
-                if (n++ >= 5) break;
-                top.Add(new { name = row[1].GetString() ?? "?", cost = Math.Round(row[0].GetDouble(), 2) });
+                var raw = row[dateIdx].ValueKind == JsonValueKind.Number
+                    ? row[dateIdx].GetInt32().ToString()
+                    : row[dateIdx].GetString() ?? "";
+                if (!DateTime.TryParseExact(raw, "yyyyMMdd", null, System.Globalization.DateTimeStyles.None, out var day)
+                    && !DateTime.TryParse(raw, out day)) continue;
+                if (!grouped.TryGetValue(day.Date, out var list)) grouped[day.Date] = list = new();
+                list.Add((row[nameIdx].GetString() ?? "?", row[costIdx].GetDouble()));
             }
-            return top;
+
+            return (grouped.ToDictionary(
+                entry => entry.Key,
+                entry => entry.Value.OrderByDescending(x => x.Cost).Take(5)
+                    .Select(x => (object)new { name = x.Name, cost = Math.Round(x.Cost, 2) }).ToList()), null);
         }
-        catch { return new { error = "parse failed" }; }
+        catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
+        {
+            return (new(), ex.Message);
+        }
     }
 }
