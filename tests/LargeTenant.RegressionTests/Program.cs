@@ -7,6 +7,176 @@ using AzureFinOps.Dashboard.Auth;
 using AzureFinOps.Dashboard.Infrastructure;
 using Microsoft.Extensions.AI;
 
+var callbackOwner = Random.Shared.NextInt64();
+Func<int, double, string, string, int, Task> noOpReporter = (_, _, _, _, _) => Task.CompletedTask;
+for (var race = 0; race < 100; race++)
+{
+    var key = Guid.NewGuid().ToString();
+    using var registration = new RetryReporterRegistration();
+    Parallel.Invoke(() => registration.Bind(key, noOpReporter), registration.Dispose);
+    registration.Bind(key, noOpReporter);
+    if (HttpHelper.RetryReporters.ContainsKey(key)) throw new InvalidOperationException("Detached reporter leaked");
+}
+Check(true, "B11: Concurrent rebind/dispose cannot leak or resurrect a reporter");
+using (var oldReporter = new RetryReporterRegistration())
+using (var newReporter = new RetryReporterRegistration())
+{
+    var key = Guid.NewGuid().ToString();
+    Func<int, double, string, string, int, Task> replacement = (_, _, _, _, _) => Task.FromResult(1);
+    oldReporter.Bind(key, noOpReporter);
+    newReporter.Bind(key, replacement);
+    oldReporter.Dispose();
+    Check(HttpHelper.RetryReporters[key] == replacement, "B11: Late disposal does not remove a replacement reporter");
+}
+var identityProbe = Guid.NewGuid().ToString();
+var mismatchedDisposed = false;
+await SessionBoundTool.VerifySessionIdAsync(identityProbe, identityProbe, () => throw new InvalidOperationException("Valid session disposed"));
+var identityRejected = false;
+try
+{
+    await SessionBoundTool.VerifySessionIdAsync(identityProbe, Guid.NewGuid().ToString(), () =>
+    { mismatchedDisposed = true; return Task.CompletedTask; });
+}
+catch (InvalidOperationException) { identityRejected = true; }
+Check(identityRejected && mismatchedDisposed, "B3: SDK session identity mismatch disposes the handle and fails before registration");
+var callbackSession = Guid.NewGuid().ToString();
+var parallelSession = Guid.NewGuid().ToString();
+var jobSession = Guid.NewGuid().ToString();
+var callbackKey = $"{callbackOwner}:{callbackSession}";
+var parallelKey = $"{callbackOwner}:{parallelSession}";
+var reportedCallbacks = new System.Collections.Concurrent.ConcurrentQueue<string>();
+var callbackGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+var callbackStarts = 0;
+using var callbackHttp = new HttpClient(new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.TooManyRequests)
+{
+    Content = new StringContent("{\"error\":{\"code\":\"429\"}}")
+}));
+var callbackInner = AIFunctionFactory.Create(async () =>
+{
+    if (Interlocked.Increment(ref callbackStarts) == 3) callbackGate.SetResult();
+    await callbackGate.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    Check(HttpHelper.CurrentTurnUserId() == callbackOwner, "Session-bound callback restores the host owner without ambient context");
+    return await HttpHelper.SendCoreAsync(callbackHttp,
+        "https://management.azure.com/subscriptions/test/providers/Microsoft.CostManagement/query",
+        Token(Guid.NewGuid(), "callback"), null, "test", HttpMethod.Post);
+}, "CallbackProbe", "Synthetic session context probe");
+HttpHelper.RetryReporters[callbackKey] = (_, _, _, _, _) => { reportedCallbacks.Enqueue(callbackKey); return Task.CompletedTask; };
+HttpHelper.RetryReporters[parallelKey] = (_, _, _, _, _) => { reportedCallbacks.Enqueue(parallelKey); return Task.CompletedTask; };
+try
+{
+    var callbacks = new[]
+    {
+        new SessionBoundTool(callbackInner, callbackOwner, callbackSession),
+        new SessionBoundTool(callbackInner, callbackOwner, parallelSession),
+        new SessionBoundTool(callbackInner, callbackOwner, jobSession)
+    };
+    Task[] pending;
+    using (ExecutionContext.SuppressFlow())
+        pending = callbacks.Select(tool => Task.Run(async () =>
+        {
+            Check(System.Diagnostics.Activity.Current is null, "Synthetic SDK callback has no inherited activity");
+            await tool.InvokeAsync(new AIFunctionArguments { ["sessionId"] = "untrusted-session", ["userId"] = "untrusted-owner" });
+            Check(System.Diagnostics.Activity.Current is null, "Callback activity is cleaned up after execution");
+        })).ToArray();
+    await Task.WhenAll(pending);
+    Check(reportedCallbacks.Count == 2 && reportedCallbacks.Count(key => key == callbackKey) == 1
+        && reportedCallbacks.Count(key => key == parallelKey) == 1,
+        "Cooldown callbacks reach only their own session; background jobs do not borrow another chat reporter");
+    var deferredCallback = DeferredTool.Wrap(callbackInner);
+    var boundDeferred = new SessionBoundTool(deferredCallback, callbackOwner, callbackSession);
+    Check(boundDeferred.Name == deferredCallback.Name && boundDeferred.JsonSchema.GetRawText() == deferredCallback.JsonSchema.GetRawText()
+        && Equals(boundDeferred.AdditionalProperties["defer"], deferredCallback.AdditionalProperties["defer"]),
+        "Session binding preserves tool schemas and deferred-tool metadata");
+}
+finally
+{
+    HttpHelper.RetryReporters.TryRemove(callbackKey, out _);
+    HttpHelper.RetryReporters.TryRemove(parallelKey, out _);
+}
+
+using (var unrelatedActivity = new System.Diagnostics.Activity("UnrelatedInvocation")
+    .SetBaggage("finops.turn.id", "other:session").Start())
+{
+    var failedInner = AIFunctionFactory.Create(async () =>
+    {
+        await Task.Yield();
+        Check(HttpHelper.CurrentTurnUserId() == callbackOwner, "Host binding overrides unrelated inherited baggage");
+        return await Task.FromException<string>(new InvalidOperationException("Synthetic tool failure"));
+    }, "FailureProbe");
+    var observedFailure = false;
+    var rebound = SessionBoundTool.Bind([failedInner], callbackOwner, callbackSession);
+    try { await ((AIFunction)rebound.Single()).InvokeAsync(new AIFunctionArguments()); }
+    catch (InvalidOperationException) { observedFailure = true; }
+    Check(observedFailure && ReferenceEquals(System.Diagnostics.Activity.Current, unrelatedActivity)
+        && unrelatedActivity.GetBaggageItem("finops.turn.id") == "other:session", "Callback failure restores the caller activity without leaking owner context");
+
+    using var cancelCallback = new CancellationTokenSource();
+    var cancelledInner = AIFunctionFactory.Create(async (CancellationToken cancellationToken) =>
+    {
+        cancelCallback.Cancel();
+        await Task.Yield();
+        cancellationToken.ThrowIfCancellationRequested();
+        return "unreachable";
+    }, "CancellationProbe");
+    var observedCancellation = false;
+    try { await new SessionBoundTool(cancelledInner, callbackOwner, callbackSession).InvokeAsync(new AIFunctionArguments(), cancelCallback.Token); }
+    catch (OperationCanceledException) { observedCancellation = true; }
+    Check(observedCancellation && ReferenceEquals(System.Diagnostics.Activity.Current, unrelatedActivity),
+        "Callback cancellation preserves cancellation semantics and restores activity context");
+}
+
+var clientCases = new (string Name, string Url, HttpMethod Method, bool Identified)[]
+{
+    ("Subscription query", "https://management.azure.com/subscriptions/test/providers/Microsoft.CostManagement/query?api-version=2021-10-01&$top=5000", HttpMethod.Post, true),
+    ("Management-group query", "https://management.azure.com/providers/Microsoft.Management/managementGroups/test/providers/Microsoft.CostManagement/query?api-version=2026-06-01", HttpMethod.Post, true),
+    ("Forecast", "https://management.azure.com/subscriptions/test/providers/Microsoft.CostManagement/forecast?api-version=2026-06-01", HttpMethod.Post, true),
+    ("Case-insensitive path", "https://management.azure.com/subscriptions/test/providers/microsoft.costmanagement/QUERY/", HttpMethod.Post, true),
+    ("Metadata GET", "https://management.azure.com/subscriptions/test/providers/Microsoft.Consumption/budgets", HttpMethod.Get, false),
+    ("Resource Graph", "https://management.azure.com/providers/Microsoft.ResourceGraph/resources", HttpMethod.Post, false),
+    ("Other service", "https://example.invalid/providers/Microsoft.CostManagement/query", HttpMethod.Post, false),
+    ("Untrusted ARM-like host", "https://management.azure.com.example.invalid/providers/Microsoft.CostManagement/query", HttpMethod.Post, false),
+    ("Insecure URL", "http://management.azure.com/providers/Microsoft.CostManagement/query", HttpMethod.Post, false),
+    ("Nonstandard port", "https://management.azure.com:444/providers/Microsoft.CostManagement/query", HttpMethod.Post, false),
+    ("Unrelated path", "https://management.azure.com/providers/Microsoft.CostManagement/queryOther", HttpMethod.Post, false),
+    ("URL query string only", "https://management.azure.com/test?path=/providers/Microsoft.CostManagement/query", HttpMethod.Post, false),
+    ("Unexpected GET", "https://management.azure.com/providers/Microsoft.CostManagement/query", HttpMethod.Get, false)
+};
+const string clientProbeBody = "{ \"type\":\"ActualCost\", \"dataSet\":{\"granularity\":\"None\"}, \"timeframe\":\"MonthToDate\" }";
+var observedClientTypes = new HashSet<string>();
+foreach (var test in clientCases)
+{
+    var expectedToken = Token(Guid.NewGuid(), "client-probe");
+    var requests = 0;
+    using var clientHttp = new HttpClient(new StubHandler(request =>
+    {
+        requests++;
+        var supplied = request.Headers.TryGetValues("ClientType", out var types) ? types.ToArray() : [];
+        Check(test.Identified ? supplied.SequenceEqual(new[] { "AzureFinOpsAgent" }) : supplied.Length == 0,
+            $"App-owned ClientType scope: {test.Name}");
+        foreach (var value in supplied) observedClientTypes.Add(value);
+        Check(request.RequestUri!.AbsoluteUri == new Uri(test.Url).AbsoluteUri && request.Method == test.Method
+            && request.Content!.ReadAsStringAsync().GetAwaiter().GetResult() == clientProbeBody
+            && request.Headers.Authorization?.Parameter == expectedToken,
+            $"Client identification preserves request URI, body, method and caller token: {test.Name}");
+        Check(request.Headers.UserAgent.ToString() == "FinOps-Dashboard/1.0"
+            && !request.Headers.Contains("Origin") && !request.Headers.Contains("Referer")
+            && !request.Headers.Contains("x-ms-command-name"),
+            $"Client identification does not impersonate Portal: {test.Name}");
+        return JsonResponse(new { properties = new { rows = Array.Empty<object>() } });
+    }));
+    await HttpHelper.SendCoreAsync(clientHttp, test.Url, expectedToken, null, "test", test.Method, clientProbeBody);
+    Check(requests == 1, $"Client identification makes one request: {test.Name}");
+}
+Check(observedClientTypes.SetEquals(new[] { "AzureFinOpsAgent" }), "ClientType stays constant across users, scopes, API versions and endpoints");
+using (var overrideHttp = new HttpClient(new StubHandler(_ => throw new InvalidOperationException("ClientType override reached HTTP"))))
+{
+    var rejected = await HttpHelper.SendCoreAsync(overrideHttp, clientCases[0].Url,
+        Token(Guid.NewGuid(), "client-override"), null, "test", HttpMethod.Post, clientProbeBody,
+        extraHeaders: new Dictionary<string, string> { ["cLiEnTtYpE"] = "untrusted-client" });
+    Check(rejected.StartsWith("HTTP 400") && !rejected.Contains("untrusted-client"),
+        "Host-owned client identity cannot be overridden or echoed");
+}
+
 var retryMethod = typeof(HttpHelper).GetMethod("ResolveRetryAfterSeconds", BindingFlags.Static | BindingFlags.NonPublic)!;
 var cases = new (string Name, string Header, string Value, double Expected)[]
 {
@@ -42,6 +212,15 @@ coordinator.RecordRequest();
 Check(coordinator.PacingDelay == TimeSpan.FromSeconds(1), "Requests are paced");
 clock.Advance(TimeSpan.FromSeconds(1));
 Check(coordinator.PacingDelay == TimeSpan.Zero, "Pacing expires");
+coordinator.RecordThrottle(60, "synthetic-caller-one");
+Check(coordinator.GetRetryAfterSeconds("synthetic-caller-one") == 60
+    && coordinator.GetRetryAfterSeconds("synthetic-caller-two") == 0,
+    "B4: Inferred fallback cooldown affects only the rejected caller");
+clock.Advance(TimeSpan.FromSeconds(30));
+Check(coordinator.GetRetryAfterSeconds("synthetic-caller-one") == 30,
+    "B4: Reading a local cooldown does not extend its expiry");
+clock.Advance(TimeSpan.FromSeconds(30));
+Check(coordinator.GetRetryAfterSeconds("synthetic-caller-one") == 0, "B4: Caller fallback expires");
 
 var tenant = Guid.NewGuid();
 var token = Token(tenant, "first");
@@ -94,6 +273,15 @@ using var failingHttp = new HttpClient(new StubHandler(_ => ++failureCalls == 1
     : new HttpResponseMessage(HttpStatusCode.Forbidden)));
 var partial = await AzureScopeDiscovery.ReadPagesAsync(failingHttp, "test-token", false);
 Check(!partial.Complete && partial.Scopes.Count == 1, "Failed later page is explicitly incomplete");
+var cacheFaultToken = Token(Guid.NewGuid(), "cache-fault");
+using (var faultHttp = new HttpClient(new StubHandler(_ => throw new ArgumentException("Synthetic discovery failure"))))
+{
+    try { await AzureScopeDiscovery.GetAsync(cacheFaultToken, false, faultHttp); }
+    catch (ArgumentException) { }
+}
+using (var recoveredHttp = new HttpClient(new StubHandler(_ => JsonResponse(new { value = Array.Empty<object>() }))))
+    Check((await AzureScopeDiscovery.GetAsync(cacheFaultToken, false, recoveredHttp)).Complete,
+        "B8: Faulted discovery task is evicted and the next call can recover");
 
 var throttledCalls = 0;
 using var throttledHttp = new HttpClient(new StubHandler(_ =>
@@ -160,6 +348,15 @@ var original = await HttpHelper.SendCoreAsync(costHttp, costUrl, cachedToken, nu
 CostQueryCoordinator.ForToken(cachedToken).RecordThrottle(60);
 var reused = await HttpHelper.SendCoreAsync(costHttp, costUrl, cachedToken, null, "test", HttpMethod.Post, "{}");
 Check(cachedCalls == 1 && original == reused && reused.Contains("Cost data fetched"), "Identical successful query reused with freshness during cooldown");
+await CostQueryCoordinator.ForToken(cachedToken).Gate.WaitAsync();
+try
+{
+    using var cacheDeadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+    var fastCached = await HttpHelper.SendCoreAsync(costHttp, costUrl, cachedToken, null, "test", HttpMethod.Post, "{}",
+        cancellationToken: cacheDeadline.Token);
+    Check(fastCached == original && cachedCalls == 1, "B5: Cache hit bypasses an occupied tenant gate");
+}
+finally { CostQueryCoordinator.ForToken(cachedToken).Gate.Release(); }
 using (var costBody = JsonDocument.Parse(reused[(reused.IndexOf('\n') + 1)..]))
     Check(costBody.RootElement.GetProperty("properties").GetProperty("rows").GetArrayLength() == 1,
         "Cost freshness preserves existing HTTP-plus-JSON parser contract");
@@ -180,6 +377,9 @@ using var toolDiscoveryHttp = new HttpClient(new StubHandler(_ =>
 }));
 await AzureScopeDiscovery.GetAsync(toolToken, false, toolDiscoveryHttp);
 var tools = new AzureQueryTools(new UserTokens { AzureToken = toolToken }).Create().ToDictionary(tool => tool.Name);
+Check(tools["QueryAzure"].Description.Contains("api-version=" + AzureApiVersions.CostQuery)
+    && tools["QueryAzure"].Description.Contains("alerts=" + AzureApiVersions.CostAlerts)
+    && !tools["QueryAzure"].Description.Contains("2026-08-01"), "B14: Tool guidance uses centralized endpoint-specific API versions");
 var lookup = await Invoke(tools["FindSubscriptions"], new AIFunctionArguments { ["search"] = "target-infrastructure" });
 using (var match = JsonDocument.Parse(lookup))
     Check(match.RootElement.GetProperty("matchCount").GetInt32() == 1 && toolDiscoveryCalls == 1,
@@ -213,6 +413,71 @@ Check(typeof(AzureQueryTools).GetMethod("TryReadCurrentMonthSpendFromBudgets", B
 var parseCost = typeof(AzureQueryTools).GetMethod("TryReadCost", BindingFlags.Static | BindingFlags.NonPublic)!;
 object?[] parseArguments = ["HTTP 200 OK\n" + JsonSerializer.Serialize(new { properties = new { nextLink = "https://management.azure.com/next" } }), 0d, null, null];
 Check(!(bool)parseCost.Invoke(null, parseArguments)!, "Unfinished cost page cannot become a total");
+var costColumns = new[] { new { name = "Cost", type = "Number" }, new { name = "Currency", type = "String" } };
+var oneScopeArgument = JsonSerializer.Serialize(new[] { new { id = Guid.NewGuid().ToString(), name = "Example" } });
+foreach (var status in new[] { 401, 500, 504, 400, 403, 404 })
+{
+    var subscriptionCalls = 0;
+    using var fallbackHttp = new HttpClient(new StubHandler(request =>
+    {
+        if (!request.RequestUri!.Query.Contains("api-version=" + AzureApiVersions.CostQuery))
+            throw new InvalidOperationException("Unexpected cost query API version");
+        if (request.RequestUri!.AbsolutePath.Contains("managementGroups"))
+        {
+            var response = new HttpResponseMessage((HttpStatusCode)status) { Content = new StringContent("{\"error\":{\"code\":\"Synthetic\"}}") };
+            response.Headers.TryAddWithoutValidation("Retry-After", "120");
+            return response;
+        }
+        subscriptionCalls++;
+        return JsonResponse(new { properties = new { columns = costColumns, rows = new[] { new object[] { 0d, "AUD" } } } });
+    }));
+    var fallbackTool = new AzureQueryTools(new UserTokens { AzureToken = Token(Guid.NewGuid(), "mg-status") }, fallbackHttp)
+        .Create().Single(tool => tool.Name == "QueryCostsAcrossSubscriptions");
+    using var result = JsonDocument.Parse(await Invoke(fallbackTool, new AIFunctionArguments
+    {
+        ["subscriptionsJson"] = oneScopeArgument, ["from"] = "2026-01-01", ["to"] = "2026-02-01", ["managementGroupId"] = "example"
+    }));
+    Check(subscriptionCalls == (status is 400 or 403 or 404 ? 1 : 0), $"B10: HTTP {status} obeys explicit management-group fallback policy");
+}
+using (var cancellation = new CancellationTokenSource())
+{
+    var requests = 0;
+    using var cancelHttp = new HttpClient(new StubHandler(_ =>
+    {
+        requests++;
+        cancellation.Cancel();
+        return JsonResponse(new { properties = new { columns = costColumns, rows = new[] { new object[] { 5d, "AUD" } } } });
+    }));
+    var cancelTool = new AzureQueryTools(new UserTokens { AzureToken = Token(Guid.NewGuid(), "cancel-cost") }, cancelHttp)
+        .Create().Single(tool => tool.Name == "QueryCostsAcrossSubscriptions");
+    var cancelled = false;
+    try
+    {
+        await cancelTool.InvokeAsync(new AIFunctionArguments
+        {
+            ["subscriptionsJson"] = JsonSerializer.Serialize(subscriptionIds.Take(3)), ["from"] = "2026-01-01", ["to"] = "2026-02-01"
+        }, cancellation.Token);
+    }
+    catch (OperationCanceledException) { cancelled = true; }
+    Check(cancelled && requests == 1, "B6: Cross-subscription cancellation stops later scopes");
+}
+object?[] emptyArguments = ["HTTP 200 OK\n" + JsonSerializer.Serialize(new { properties = new { columns = costColumns, rows = Array.Empty<object>() } }), 0d, null, null];
+Check(!(bool)parseCost.Invoke(null, emptyArguments)! && (string?)emptyArguments[3] == AzureQueryTools.NoCostRows,
+    "B1: Empty cost rows are noData, not a measured zero");
+object?[] zeroArguments = ["HTTP 200 OK\n" + JsonSerializer.Serialize(new { properties = new { columns = costColumns, rows = new[] { new object[] { 0d, "AUD" } } } }), 0d, null, null];
+Check((bool)parseCost.Invoke(null, zeroArguments)! && (double)zeroArguments[1]! == 0 && (string?)zeroArguments[2] == "AUD",
+    "B1: An explicit zero row with currency is a measured zero");
+var noDataScope = Guid.NewGuid().ToString();
+using (var summary = JsonDocument.Parse(AzureQueryTools.BuildCostResponse("test", new[] { (noDataScope, "Example") },
+    new Dictionary<string, AzureQueryTools.CostScopeResult>
+    { [noDataScope] = new(noDataScope, "Example", 200, null, null, AzureQueryTools.NoCostRows) }, false)))
+{
+    Check(!summary.RootElement.GetProperty("complete").GetBoolean()
+        && summary.RootElement.GetProperty("totalCost").ValueKind == JsonValueKind.Null
+        && summary.RootElement.GetProperty("noData").GetInt32() == 1
+        && summary.RootElement.GetProperty("succeeded").GetInt32() == 0,
+        "B1: Empty estate results never become complete zero spend");
+}
 var crawlScopes = Enumerable.Range(0, 227).Select(index => new CrawlMaturityTools.SubscriptionScope(
     Guid.NewGuid().ToString(), "Example-subscription-" + index + new string('x', 150))).ToArray();
 var crawlBudgets = crawlScopes.Select(scope => new CrawlMaturityTools.BudgetEvidence(
@@ -261,6 +526,18 @@ var crawlCalls = 0;
 using var crawlHttp = new HttpClient(new StubHandler(request =>
 {
     crawlCalls++;
+    if (request.Method == HttpMethod.Get)
+    {
+        var expected = request.RequestUri!.AbsolutePath.Split('/').Last() switch
+        {
+            "budgets" => AzureApiVersions.Budgets,
+            "exports" => AzureApiVersions.CostExports,
+            "alerts" => AzureApiVersions.CostAlerts,
+            "scheduledActions" => AzureApiVersions.ScheduledActions,
+            _ => throw new InvalidOperationException("Unexpected Crawl endpoint")
+        };
+        if (!request.RequestUri.Query.Contains("api-version=" + expected)) throw new InvalidOperationException("Crawl API version drift");
+    }
     return request.Method == HttpMethod.Post ? JsonResponse(new { data = Array.Empty<object>() })
         : JsonResponse(new { value = Array.Empty<object>() });
 }));
@@ -307,7 +584,7 @@ using (var truncatedHttp = new HttpClient(new StubHandler(request => request.Met
 var slowHandler = new CancelOnRequestHandler();
 using var slowHttp = new HttpClient(slowHandler);
 var partialTool = new CrawlMaturityTools(new UserTokens { AzureToken = Token(Guid.NewGuid(), "slow-crawl") },
-    (_, _) => { }, slowHttp, TimeSpan.FromMilliseconds(100)).Create().Single();
+    (_, _) => throw new InvalidOperationException("Incomplete Crawl must not be persisted"), slowHttp, TimeSpan.FromMilliseconds(100)).Create().Single();
 var partialTimer = System.Diagnostics.Stopwatch.StartNew();
 var partialCrawl = await Invoke(partialTool, crawlArguments);
 using (var result = JsonDocument.Parse(partialCrawl))
@@ -317,9 +594,50 @@ using (var result = JsonDocument.Parse(partialCrawl))
         "Crawl deadline returns an explicitly incomplete assessment");
     Check(result.RootElement.GetProperty("scores").EnumerateArray().All(score => !score.GetProperty("evidenceComplete").GetBoolean()),
         "Timeouts never appear as verified absence of controls");
+    Check(!result.RootElement.GetProperty("historyWriteRequested").GetBoolean(), "B9: Incomplete Crawl does not update score history");
 }
 Check(partialTimer.Elapsed < TimeSpan.FromSeconds(5) && slowHandler.Requests <= 12 && slowHandler.Active == 0,
     "Crawl cancels queued and in-flight work, preserving the concurrency bound");
+Check(!ScoreTools.HasCompleteEvidence("[{\"evidenceComplete\":false}]")
+    && ScoreTools.HasCompleteEvidence("[{\"evidenceComplete\":true}]")
+    && ScoreTools.HasCompleteEvidence("[{\"score\":2}]"), "B9: History comparisons reject explicit incomplete entries while retaining legacy history");
+var stateToken = Token(Guid.NewGuid(), "scope-state");
+var states = new[] { "Enabled", "Warned", "PastDue", "Disabled", "Deleted" };
+var stateIds = states.Select(_ => Guid.NewGuid().ToString()).ToArray();
+using (var stateDiscoveryHttp = new HttpClient(new StubHandler(_ => JsonResponse(new
+{
+    value = states.Select((state, index) => new { subscriptionId = stateIds[index], displayName = "Example-" + state, state })
+}))))
+    await AzureScopeDiscovery.GetAsync(stateToken, false, stateDiscoveryHttp);
+using (var stateHttp = new HttpClient(new StubHandler(request =>
+{
+    Check(!stateIds.Skip(3).Any(id => request.RequestUri!.AbsolutePath.Contains(id)), "B7: Automatic Crawl skips disabled/deleted collection reads");
+    return request.Method == HttpMethod.Post ? JsonResponse(new { data = Array.Empty<object>() }) : JsonResponse(new { value = Array.Empty<object>() });
+})))
+{
+    var stateTool = new CrawlMaturityTools(new UserTokens { AzureToken = stateToken },
+        (_, _) => throw new InvalidOperationException("Excluded estate scopes must not update history"), stateHttp, TimeSpan.FromSeconds(30)).Create().Single();
+    using var result = JsonDocument.Parse(await Invoke(stateTool, new AIFunctionArguments { ["subscriptionsJson"] = "all" }));
+    Check(result.RootElement.GetProperty("scopeSelection").GetProperty("excluded").GetInt32() == 2
+        && result.RootElement.GetProperty("evidence").GetProperty("subscriptionCount").GetInt32() == 3
+        && !result.RootElement.GetProperty("complete").GetBoolean(), "B7: Warned and PastDue scopes are retained and exclusions prevent an estate-complete claim");
+}
+var historicalScopes = new HashSet<string>();
+using (var historicalHttp = new HttpClient(new StubHandler(request =>
+{
+    historicalScopes.Add(request.RequestUri!.Segments[2].Trim('/'));
+    return JsonResponse(new { properties = new { columns = new[] { new { name = "Cost" }, new { name = "Currency" } }, rows = new[] { new object[] { 5, "USD" } } } });
+})))
+{
+    var historicalTool = new AzureQueryTools(new UserTokens { AzureToken = stateToken }, historicalHttp).Create()
+        .Single(tool => tool.Name == "QueryCostsAcrossSubscriptions");
+    using var result = JsonDocument.Parse(await Invoke(historicalTool, new AIFunctionArguments
+    {
+        ["subscriptionsJson"] = "all", ["from"] = "2026-01-01", ["to"] = "2026-02-01"
+    }));
+    Check(historicalScopes.SetEquals(stateIds) && result.RootElement.GetProperty("complete").GetBoolean(),
+        "B7: Historical costs retain every discovered subscription state");
+}
 using (var cancelled = new CancellationTokenSource())
 using (var neverCalled = new HttpClient(new StubHandler(_ => throw new InvalidOperationException("Cancelled request reached HTTP"))))
 {

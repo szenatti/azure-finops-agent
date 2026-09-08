@@ -42,19 +42,18 @@ public static class HttpHelper
 
     /// <summary>
     /// Per-turn hook for reporting 429/5xx retries to the SSE stream. Keyed by
-    /// <c>userId:sessionId</c> (the "turn id") so it survives the JSON-RPC tool-callback
-    /// boundary from the Copilot CLI (where AsyncLocal does NOT flow), AND so concurrent
+    /// <c>userId:sessionId</c> (the "turn id") so concurrent
     /// turns from the same user (two tabs, sidebar score racing chat) don't clobber each
-    /// other's reporter. ChatEndpoints stamps the turn id into Activity Baggage as
-    /// <c>finops.turn.id</c>; tools look it up via the current activity's baggage.
+    /// other's reporter. SessionBoundTool restores the host-bound session identity as
+    /// <c>finops.turn.id</c> on callback entry; transport baggage propagation is not required.
     /// Null lookup = no-op. Signature: (attemptNumber, waitSeconds, url, telemetryPrefix, statusCode).
     /// </summary>
     public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Func<int, double, string, string, int, Task>> RetryReporters = new();
 
     /// <summary>
     /// Resolves the calling user's id from the per-turn Activity Baggage
-    /// (<c>finops.turn.id</c> = <c>{userId}:{sessionId}</c>, stamped by ChatEndpoints
-    /// before SendAsync). Null when called outside a chat turn. Used to bind
+    /// (<c>finops.turn.id</c> = <c>{userId}:{sessionId}</c>, restored by SessionBoundTool).
+    /// Null outside a bound invocation or chat activity. Used to bind
     /// generated artifacts (scripts, decks) to their owner so the download
     /// endpoints can enforce per-user access.
     /// </summary>
@@ -75,6 +74,7 @@ public static class HttpHelper
 
     private const int MaxRetryWaitSeconds = 60;
     private const int MaxInteractiveRetryWaitSeconds = 5;
+    private const string CostManagementClientType = "AzureFinOpsAgent";
 
     private static readonly SemaphoreSlim CostMgmtGate = new(2, 2);
     private const int CostMgmtQueueNotifyMs = 250;
@@ -88,6 +88,15 @@ public static class HttpHelper
     private static bool IsInteractiveCostQueryUrl(string url) =>
         url.Contains("/Microsoft.CostManagement/query", StringComparison.OrdinalIgnoreCase)
         || url.Contains("/Microsoft.CostManagement/forecast", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsArmCostQueryUrl(string url) =>
+        Uri.TryCreate(url, UriKind.Absolute, out var uri)
+        && uri.Scheme == Uri.UriSchemeHttps
+        && uri.Host.Equals("management.azure.com", StringComparison.OrdinalIgnoreCase)
+        && uri.Port == 443
+        && string.IsNullOrEmpty(uri.UserInfo)
+        && (uri.AbsolutePath.TrimEnd('/').EndsWith("/providers/Microsoft.CostManagement/query", StringComparison.OrdinalIgnoreCase)
+            || uri.AbsolutePath.TrimEnd('/').EndsWith("/providers/Microsoft.CostManagement/forecast", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// Retries transient failures within a bounded wait budget, respecting all server retry hints.
@@ -128,6 +137,9 @@ public static class HttpHelper
         cancellationToken.ThrowIfCancellationRequested();
         http ??= Http;
         method ??= HttpMethod.Get;
+        var identifyCostClient = method == HttpMethod.Post && IsArmCostQueryUrl(url);
+        if (identifyCostClient && extraHeaders?.Keys.Any(key => key.Equals("ClientType", StringComparison.OrdinalIgnoreCase)) == true)
+            return "HTTP 400 BadRequest\nClientType is host-managed for Cost Management query and forecast requests.";
 
         var totalSw = Stopwatch.StartNew();
         var totalWaitSec = 0.0;
@@ -149,6 +161,12 @@ public static class HttpHelper
             ? Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
                 System.Text.Json.JsonSerializer.Serialize(new { token, url, jsonBody, includeTimestamp }))))
             : null;
+        if (cacheKey is not null && CostResponses.TryGetValue(cacheKey, out string? immediateResponse))
+        {
+            activity?.SetTag($"{telemetryPrefix}.result", "cache_hit");
+            activity?.SetTag($"{telemetryPrefix}.status_code", 200);
+            return immediateResponse!;
+        }
         var gate = costQuery?.Gate ?? CostMgmtGate;
         var safeMetadataBypass = bypassCostManagementGate
             && method == HttpMethod.Get
@@ -191,9 +209,9 @@ public static class HttpHelper
                 activity?.SetTag($"{telemetryPrefix}.status_code", 200);
                 return cachedResponse!;
             }
-            if (costQuery?.RetryAfterSeconds is > 0)
+            if (costQuery?.GetRetryAfterSeconds(token) is > 0)
             {
-                var remainingSeconds = costQuery.RetryAfterSeconds;
+                var remainingSeconds = costQuery.GetRetryAfterSeconds(token);
                 activity?.SetTag($"{telemetryPrefix}.result", "tenant_cooldown");
                 activity?.SetTag($"{telemetryPrefix}.status_code", 429);
                 activity?.SetStatus(ActivityStatusCode.Error, "Tenant cost query cooldown");
@@ -222,6 +240,8 @@ public static class HttpHelper
                 using var req = new HttpRequestMessage(method, url);
                 req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
                 req.Headers.Add("User-Agent", "FinOps-Dashboard/1.0");
+                if (identifyCostClient)
+                    req.Headers.Add("ClientType", CostManagementClientType);
 
                 if (extraHeaders is not null)
                     foreach (var (key, value) in extraHeaders)
@@ -273,7 +293,7 @@ public static class HttpHelper
                 finalRetrySeconds = waitSeconds;
                 if (isThrottle)
                 {
-                    costQuery?.RecordThrottle(waitSeconds);
+                    costQuery?.RecordThrottle(waitSeconds, serverDelay > 0 ? null : token);
                     activity?.SetTag($"{telemetryPrefix}.retry_after_sec", waitSeconds);
                     activity?.SetTag($"{telemetryPrefix}.retry_delay_source", serverDelay > 0 ? "server" : "fallback");
                     if (res.Headers.TryGetValues("x-ms-request-id", out var requestIds))
@@ -302,11 +322,6 @@ public static class HttpHelper
                 // again. Prefix matches the tool/scope tag in App Insights.
                 Logger?.LogWarning("HTTP retry {Tool} attempt={Attempt} status={Status} waitSec={Wait:F1} url={Url}",
                     telemetryPrefix, attempt + 1, reason, waitSeconds, url);
-                // Look up the SSE reporter via Activity Baggage — baggage
-                // propagates across W3C tracecontext boundaries (including the
-                // Copilot CLI subprocess JSON-RPC tool callback) where RootId
-                // does not. ChatEndpoints stamps "finops.turn.id" (userId:sessionId)
-                // on the chat activity before SendAsync.
                 if (report is not null)
                 {
                     try { await report(attempt + 1, waitSeconds, url, telemetryPrefix, status); }

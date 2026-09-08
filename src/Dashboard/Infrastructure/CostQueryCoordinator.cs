@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 
 namespace AzureFinOps.Dashboard.Infrastructure;
@@ -9,6 +11,7 @@ internal sealed class CostQueryCoordinator(TimeProvider clock)
     private static readonly ConcurrentDictionary<string, CostQueryCoordinator> Tenants = new();
     private DateTimeOffset _retryAt;
     private DateTimeOffset _nextRequestAt;
+    private readonly Dictionary<string, DateTimeOffset> _callerCooldowns = new();
 
     internal SemaphoreSlim Gate { get; } = new(1, 1);
     internal double RetryAfterSeconds => Math.Max(0, (_retryAt - clock.GetUtcNow()).TotalSeconds);
@@ -17,13 +20,27 @@ internal sealed class CostQueryCoordinator(TimeProvider clock)
 
     internal void RecordRequest() => _nextRequestAt = clock.GetUtcNow().AddSeconds(1);
 
-    internal void RecordThrottle(double seconds)
+    internal double GetRetryAfterSeconds(string token) => Math.Max(RetryAfterSeconds,
+        _callerCooldowns.TryGetValue(CallerKey(token), out var retryAt) ? Math.Max(0, (retryAt - clock.GetUtcNow()).TotalSeconds) : 0);
+
+    internal void RecordThrottle(double seconds, string? callerToken = null)
     {
         var now = clock.GetUtcNow();
         var availableSeconds = (DateTimeOffset.MaxValue - now).TotalSeconds;
         var retryAt = seconds >= availableSeconds ? DateTimeOffset.MaxValue : now.AddSeconds(seconds);
-        if (retryAt > _retryAt) _retryAt = retryAt;
+        if (callerToken is null)
+        {
+            if (retryAt > _retryAt) _retryAt = retryAt;
+            return;
+        }
+        foreach (var key in _callerCooldowns.Where(entry => entry.Value <= now).Select(entry => entry.Key).ToArray())
+            _callerCooldowns.Remove(key);
+        var callerKey = CallerKey(callerToken);
+        if (!_callerCooldowns.TryGetValue(callerKey, out var current) || retryAt > current)
+            _callerCooldowns[callerKey] = retryAt;
     }
+
+    private static string CallerKey(string token) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
 
     internal static CostQueryCoordinator ForToken(string token) =>
         Tenants.GetOrAdd(TenantKey(token), _ => new CostQueryCoordinator(TimeProvider.System));

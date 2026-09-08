@@ -106,6 +106,7 @@ Return scores array: id=slug, label=exact name above, score=0-5, detail=one-line
         {
             history = LoadHistory();
         }
+        history = history.Where(entry => HasCompleteEvidence(entry.Scores)).ToList();
 
         if (!string.IsNullOrWhiteSpace(level))
             history = history.Where(h => h.Level.Equals(level.Trim(), StringComparison.OrdinalIgnoreCase)).ToList();
@@ -114,6 +115,18 @@ Return scores array: id=slug, label=exact name above, score=0-5, detail=one-line
             return "No score history found. Run a maturity scoring first to establish a baseline.";
 
         return JsonSerializer.Serialize(history);
+    }
+
+    internal static bool HasCompleteEvidence(string scores)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(scores);
+            return document.RootElement.ValueKind == JsonValueKind.Array
+                && document.RootElement.EnumerateArray().All(score => score.ValueKind == JsonValueKind.Object
+                    && (!score.TryGetProperty("evidenceComplete", out var complete) || complete.ValueKind == JsonValueKind.True));
+        }
+        catch (JsonException) { return false; }
     }
 
     private List<ScoreHistoryEntry> LoadHistory()

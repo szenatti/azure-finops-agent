@@ -568,6 +568,7 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
     {
         var config = await CreateSessionConfigAsync(userId, entraOid);
         var session = await _copilotClient.CreateSessionAsync(config);
+        await VerifySessionIdentityAsync(config.SessionId, session);
         _telemetry.LiveSessions[session.SessionId] = new LiveSessionInfo
         {
             Session = session,
@@ -615,8 +616,9 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
             return live.Session;
         }
 
-        var resumeConfig = await CreateResumeConfigAsync(userId, entraOid);
+        var resumeConfig = await CreateResumeConfigAsync(userId, entraOid, sessionId);
         var resumed = await _copilotClient.ResumeSessionAsync(sessionId, resumeConfig, CancellationToken.None);
+        await VerifySessionIdentityAsync(sessionId, resumed);
         _telemetry.LiveSessions[sessionId] = new LiveSessionInfo
         {
             Session = resumed,
@@ -742,10 +744,11 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
             return await live.Session.GetEventsAsync(ct);
         }
 
-        var resumeConfig = await CreateResumeConfigAsync(userId, entraOid);
+        var resumeConfig = await CreateResumeConfigAsync(userId, entraOid, sessionId);
         try
         {
             var ephemeral = await _copilotClient.ResumeSessionAsync(sessionId, resumeConfig, ct);
+            await VerifySessionIdentityAsync(sessionId, ephemeral);
             try { return await ephemeral.GetEventsAsync(ct); }
             finally { try { await ephemeral.DisposeAsync(); } catch { } }
         }
@@ -800,6 +803,13 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
         }
     }
 
+    private async Task VerifySessionIdentityAsync(string? expected, CopilotSession session)
+    {
+        if (!string.Equals(expected, session.SessionId, StringComparison.Ordinal))
+            _logger.LogError("SDK session identity mismatch; refusing registration of the returned session.");
+        await SessionBoundTool.VerifySessionIdAsync(expected, session.SessionId, async () => await session.DisposeAsync());
+    }
+
     private async Task<SessionConfig> CreateSessionConfigAsync(long userId, string? entraOid)
     {
         // Seed token eagerly so the very first model call doesn't pay the
@@ -808,15 +818,17 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
         var effort = IsReasoningModel(_deployment) ? _reasoningEffort : null;
         _logger.LogInformation("SessionConfig(create) model={Model} reasoningEffort={Effort} isReasoning={IsReasoning}",
             _deployment, effort ?? "<null>", IsReasoningModel(_deployment));
+        var sessionId = Guid.NewGuid().ToString();
         return new SessionConfig
         {
+            SessionId = sessionId,
             Model = _deployment,
             ReasoningEffort = effort,
             // Stream concise reasoning summaries so the UI can show live
             // "thinking" feedback during the otherwise-silent reasoning phase.
             ReasoningSummary = effort is null ? null : ReasoningSummary.Concise,
             Streaming = true,
-            Tools = GetOrCreateUserTools(userId),
+            Tools = SessionBoundTool.Bind(GetOrCreateUserTools(userId), userId, sessionId),
             ExcludedTools = ExcludedBuiltInTools,
             // Explicitly pin tool-search deferral ON (SDK 1.0.7 formalized the
             // option; default may drift across SDK/CLI bumps). Our DeferredTool
@@ -855,7 +867,7 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
         };
     }
 
-    private async Task<ResumeSessionConfig> CreateResumeConfigAsync(long userId, string? entraOid)
+    private async Task<ResumeSessionConfig> CreateResumeConfigAsync(long userId, string? entraOid, string sessionId)
     {
         var bearerToken = await GetAzureOpenAIBearerTokenAsync();
         var effort = IsReasoningModel(_deployment) ? _reasoningEffort : null;
@@ -869,7 +881,7 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
             // "thinking" feedback during the otherwise-silent reasoning phase.
             ReasoningSummary = effort is null ? null : ReasoningSummary.Concise,
             Streaming = true,
-            Tools = GetOrCreateUserTools(userId),
+            Tools = SessionBoundTool.Bind(GetOrCreateUserTools(userId), userId, sessionId),
             ExcludedTools = ExcludedBuiltInTools,
             // See CreateSessionConfigAsync — keep deferral pinned on for resumes too.
             ToolSearch = new ToolSearchConfig { Enabled = true },

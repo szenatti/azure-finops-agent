@@ -38,6 +38,13 @@ processors:
       - context: spanevent
         statements:
           - truncate_all(attributes, 4096)
+    log_statements:
+      - context: resource
+        statements:
+          - truncate_all(attributes, 4096)
+      - context: log
+        statements:
+          - truncate_all(attributes, 4096)
   # Drop noisy /robots.txt and bot-crawler spans that bloat the bill.
   filter/drop_noise:
     error_mode: ignore
@@ -68,5 +75,5 @@ service:
       exporters: [azuremonitor]
     logs:
       receivers: [otlp]
-      processors: [batch]
+      processors: [transform/limit_attributes, batch]
       exporters: [azuremonitor]

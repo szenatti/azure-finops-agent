@@ -21,9 +21,17 @@ namespace AzureFinOps.Dashboard.AI.Tools;
 /// </summary>
 public class AzureQueryTools
 {
+    internal const string NoCostRows = "No matching cost rows were returned; spend is unknown, not zero.";
     private readonly UserTokens _tokens;
+    private readonly HttpClient? _http;
 
-    public AzureQueryTools(UserTokens tokens) => _tokens = tokens;
+    public AzureQueryTools(UserTokens tokens) : this(tokens, null) { }
+
+    internal AzureQueryTools(UserTokens tokens, HttpClient? http)
+    {
+        _tokens = tokens;
+        _http = http;
+    }
 
     public IEnumerable<AIFunction> Create()
     {
@@ -41,7 +49,8 @@ Use standard ARM URL conventions; you know the resource providers and current ap
   /providers/Microsoft.Billing/billingAccounts/{billingAccountId}[/billingProfiles/{id}|/invoiceSections/{id}]
 Never bare /providers/Microsoft.CostManagement/... — that returns 400.
 
-COST MANAGEMENT QUERY: use api-version=2026-08-01. ALWAYS group by a real dimension (ServiceName, ResourceGroupName, MeterCategory). Do NOT add 'UsageDate' to the grouping array — it's a response column, not a dimension; use granularity=""Daily"" for per-day. Never request raw ungrouped cost data. For totals across all subscriptions, use QueryCostsAcrossSubscriptions with subscriptionsJson='all'; never fan out one query per subscription. Budget currentSpend is last evaluated spend, NOT live cost and NOT a service breakdown. GET /subscriptions returns a compact page; use FindSubscriptions for name resolution.
+COST MANAGEMENT QUERY: use api-version=" + AzureApiVersions.CostQuery + @". ALWAYS group by a real dimension (ServiceName, ResourceGroupName, MeterCategory). Do NOT add 'UsageDate' to the grouping array — it's a response column, not a dimension; use granularity=""Daily"" for per-day. Never request raw ungrouped cost data. For totals across all subscriptions, use QueryCostsAcrossSubscriptions with subscriptionsJson='all'; never fan out one query per subscription. Budget currentSpend is last evaluated spend, NOT live cost and NOT a service breakdown. GET /subscriptions returns a compact page; use FindSubscriptions for name resolution.
+OTHER COST API VERSIONS: forecast=" + AzureApiVersions.CostForecast + "; exports=" + AzureApiVersions.CostExports + "; alerts=" + AzureApiVersions.CostAlerts + "; scheduledActions=" + AzureApiVersions.ScheduledActions + "; Consumption budgets=" + AzureApiVersions.Budgets + @". Each endpoint has its own supported version; do not invent a newer one. Preserve versions explicitly requested for controlled comparisons.
 
 THROTTLING: Cost Management /query and /forecast are aggressively throttled per-tenant. Interactive queries make at most one short retry; other transient calls retain the standard retry policy. Do NOT call multiple CostManagement endpoints in parallel from the same turn — Resource Graph and Advisor parallelize fine. If a call still returns HTTP 429, do not make another Cost Management call in the same turn; report the throttle and offer to retry later.
 
@@ -141,8 +150,10 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
         [Description("Use 'all' for all accessible subscriptions, or a JSON array of explicitly selected objects with id and name fields")] string subscriptionsJson,
         [Description("Inclusive start date in yyyy-MM-dd format")] string from,
         [Description("Exclusive end date in yyyy-MM-dd format")] string to,
-        [Description("Optional management-group id or full ARM path from the connection context")] string? managementGroupId = null)
+        [Description("Optional management-group id or full ARM path from the connection context")] string? managementGroupId = null,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         using var activity = HttpHelper.Telemetry.StartActivity("QueryCostsAcrossSubscriptions");
         var token = _tokens.AzureToken;
         if (string.IsNullOrEmpty(token))
@@ -161,10 +172,13 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
         var scopes = new List<(string Id, string Name)>();
         if (subscriptionsJson.Trim().Equals("all", StringComparison.OrdinalIgnoreCase))
         {
-            var discovery = await AzureScopeDiscovery.SubscriptionsAsync(token);
+            var discovery = await AzureScopeDiscovery.SubscriptionsAsync(token, cancellationToken);
             if (!discovery.Complete)
                 return JsonSerializer.Serialize(new { complete = false, source = "scopeDiscovery", detail = discovery.Error });
-            subscriptionsJson = JsonSerializer.Serialize(discovery.Scopes.Select(scope => new { id = scope.Id, name = scope.Name }));
+            subscriptionsJson = JsonSerializer.Serialize(discovery.Scopes
+                .OrderBy(scope => string.Equals(scope.State, "Enabled", StringComparison.OrdinalIgnoreCase) ? 0
+                    : string.Equals(scope.State, "Warned", StringComparison.OrdinalIgnoreCase) ? 1 : 2)
+                .Select(scope => new { id = scope.Id, name = scope.Name }));
         }
         try
         {
@@ -248,10 +262,10 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
                         }
                     }
                 });
-                var mgUrl = $"https://management.azure.com/providers/Microsoft.Management/managementGroups/{Uri.EscapeDataString(mgName)}/providers/Microsoft.CostManagement/query?api-version=2026-08-01";
-                var mgResponse = await HttpHelper.SendWithRetryAsync(
-                    mgUrl, token, activity, "cost.cross_subscription.mg",
-                    method: HttpMethod.Post, jsonBody: mgBody);
+                var mgUrl = $"https://management.azure.com/providers/Microsoft.Management/managementGroups/{Uri.EscapeDataString(mgName)}/providers/Microsoft.CostManagement/query?api-version={AzureApiVersions.CostQuery}";
+                var mgResponse = await HttpHelper.SendCoreAsync(
+                    _http, mgUrl, token, activity, "cost.cross_subscription.mg",
+                    method: HttpMethod.Post, jsonBody: mgBody, cancellationToken: cancellationToken);
                 if (mgResponse.StartsWith("HTTP 200", StringComparison.Ordinal))
                 {
                     var aggregate = ParseAggregateCostResponse(mgResponse, scopes);
@@ -265,13 +279,16 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
                         ? aggregate.Results
                         : new Dictionary<string, CostScopeResult>(StringComparer.OrdinalIgnoreCase);
                 }
-                if (mgResponse.StartsWith("HTTP 429", StringComparison.Ordinal))
+                var mgStatus = ParseStatusCode(mgResponse);
+                if (mgStatus != 200 && mgStatus is not (400 or 403 or 404))
                     return JsonSerializer.Serialize(new
                     {
                         complete = false,
                         source = "managementGroup",
-                        throttled = true,
+                        status = mgStatus,
+                        throttled = mgStatus == 429,
                         attempted = 1,
+                        unattempted = scopes.Count,
                         subscriptionCount = scopes.Count,
                         detail = FirstLineAndBody(mgResponse, 500)
                     });
@@ -286,6 +303,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
 
         for (var i = 0; i < remainingScopes.Count; i++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var scope = remainingScopes[i];
             if (i >= 20)
             {
@@ -293,10 +311,10 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
                     "not attempted: interactive query limit; use an aggregate scope or cost export");
                 continue;
             }
-            var url = $"https://management.azure.com/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/query?api-version=2026-08-01";
-            var response = await HttpHelper.SendWithRetryAsync(
-                url, token, activity, "cost.cross_subscription.subscription",
-                method: HttpMethod.Post, jsonBody: body);
+            var url = $"https://management.azure.com/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/query?api-version={AzureApiVersions.CostQuery}";
+            var response = await HttpHelper.SendCoreAsync(
+                _http, url, token, activity, "cost.cross_subscription.subscription",
+                method: HttpMethod.Post, jsonBody: body, cancellationToken: cancellationToken);
 
             string? parseError = null;
             if (response.StartsWith("HTTP 200", StringComparison.Ordinal)
@@ -482,7 +500,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
                 // aggregate says otherwise (or omits currency for non-zero
                 // cost), leave it missing so the per-subscription query path
                 // can validate it independently.
-                if (value.Currencies.Count > 1 || (value.Cost != 0 && value.Currencies.Count != 1))
+                if (value.Currencies.Count != 1)
                     continue;
                 var scope = expectedById[id];
                 results[id] = new(
@@ -504,7 +522,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
         }
     }
 
-    private static string BuildCostResponse(
+    internal static string BuildCostResponse(
         string source,
         IReadOnlyList<(string Id, string Name)> scopes,
         IReadOnlyDictionary<string, CostScopeResult> resultsById,
@@ -516,12 +534,12 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
                 : new CostScopeResult(scope.Id, scope.Name, 0, null, null, "not returned")).ToList();
         var succeeded = orderedResults.Count(r => r.Status == 200 && r.Cost is not null);
         var unknownCurrencyCost = orderedResults.Any(r =>
-            r.Status == 200 && r.Cost is not null && r.Cost != 0 && string.IsNullOrWhiteSpace(r.Currency));
+            r.Status == 200 && r.Cost is not null && string.IsNullOrWhiteSpace(r.Currency));
         var totalsByCurrency = orderedResults
             .Where(r => r.Status == 200 && r.Cost is not null && !string.IsNullOrWhiteSpace(r.Currency))
             .GroupBy(r => r.Currency!, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => Math.Round(g.Sum(r => r.Cost!.Value), 6), StringComparer.OrdinalIgnoreCase);
-        var complete = succeeded == scopes.Count && !unknownCurrencyCost;
+        var complete = scopes.Count > 0 && succeeded == scopes.Count && !unknownCurrencyCost;
         var singleCurrency = totalsByCurrency.Count == 1 ? totalsByCurrency.Keys.Single() : null;
         var safeAggregate = totalsByCurrency.Count <= 1 && !unknownCurrencyCost;
         var summedCost = safeAggregate
@@ -535,7 +553,9 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
             throttled,
             subscriptionCount = scopes.Count,
             succeeded,
-            failed = orderedResults.Count(result => result.Status != 0 && (result.Status != 200 || result.Cost is null)),
+            noData = orderedResults.Count(result => result.Status == 200 && result.Cost is null && result.Error == NoCostRows),
+            failed = orderedResults.Count(result => result.Status != 0 && (result.Status != 200 || result.Cost is null)
+                && !(result.Status == 200 && result.Error == NoCostRows)),
             unattempted = orderedResults.Count(result => result.Status == 0),
             resultsTruncated = orderedResults.Count > 50,
             freshness = "Cost Management queries may be cached for five minutes; upstream cost ingestion may lag usage.",
@@ -552,6 +572,8 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
                 status = r.Status,
                 cost = r.Cost,
                 currency = r.Currency,
+                outcome = r.Status == 200 && r.Error == NoCostRows ? "noData"
+                    : r.Status == 200 && r.Cost is not null ? "measured" : r.Status == 0 ? "notAttempted" : "failed",
                 error = r.Error
             })
         }, new JsonSerializerOptions { WriteIndented = true });
@@ -577,7 +599,13 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
             var costIndex = columns.TryGetValue("Cost", out var ci) ? ci : columns["PreTaxCost"];
             var currencyIndex = columns.TryGetValue("Currency", out var cui) ? cui : -1;
             var currencies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var row in props.GetProperty("rows").EnumerateArray())
+            var rows = props.GetProperty("rows");
+            if (rows.GetArrayLength() == 0)
+            {
+                error = NoCostRows;
+                return false;
+            }
+            foreach (var row in rows.EnumerateArray())
             {
                 var rowCost = row[costIndex].GetDouble();
                 if (!double.IsFinite(rowCost))
@@ -597,9 +625,9 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
                 error = "Cost response contained more than one currency.";
                 return false;
             }
-            if (cost != 0 && currencies.Count != 1)
+            if (currencies.Count != 1)
             {
-                error = "Cost response omitted currency for non-zero cost.";
+                error = "Cost response omitted currency.";
                 return false;
             }
             currency = currencies.Count == 1 ? currencies.Single() : null;
@@ -636,7 +664,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
         string? Currency,
         string? BudgetName);
 
-    private sealed record CostScopeResult(
+    internal sealed record CostScopeResult(
         string SubscriptionId,
         string SubscriptionName,
         int Status,
@@ -688,7 +716,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
                    "  /providers/Microsoft.Management/managementGroups/{mgId}\n" +
                    "  /providers/Microsoft.Billing/billingAccounts/{billingAccountId}\n" +
                    "  /providers/Microsoft.Billing/billingAccounts/{billingAccountId}/billingProfiles/{profileId}\n" +
-                   "Example: POST /subscriptions/abc-123/providers/Microsoft.CostManagement/query?api-version=2026-08-01";
+                   $"Example: POST /subscriptions/{{subscriptionId}}/providers/Microsoft.CostManagement/query?api-version={AzureApiVersions.CostQuery}";
         }
         return null;
     }

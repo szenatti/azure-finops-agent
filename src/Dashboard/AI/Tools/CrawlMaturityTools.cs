@@ -39,8 +39,8 @@ public sealed class CrawlMaturityTools
 
     public IEnumerable<AIFunction> Create()
     {
-        yield return AIFunctionFactory.Create(GetCrawlMaturityEvidence, "GetCrawlMaturityEvidence", @"Collects, scores, and persists all seven Crawl maturity dimensions in ONE tool call: budgets/last evaluated spend, exact CostCenter/Owner/Environment tagging, exports, alerts/scheduled actions, policy guardrails, common waste, and cost visibility. It also returns ready-to-render fix actions. Low-cost metadata reads run with bounded server-side concurrency. Budget currentSpend is the last budget evaluation, not live Cost Analysis data; report it only as last evaluated spend with coverage, never as an authoritative live MTD total.
-    Use exactly once for Crawl/FinOps maturity scoring. Pass subscriptionsJson='all' for the full accessible estate, or an explicit JSON array for a user-selected subset. Discovery is host-side; never copy a long context array or use shell tools. Evidence reads have a 30-second budget and reuse caller-isolated successful reads for five minutes. Results are compact with coverage and provisional scores for incomplete evidence; partial scores are not proof that controls are missing. Do NOT supplement it with QueryAzure, ReportMaturityScore, SuggestFollowUp, shell, file-reading, or any other tool—the score persistence, maturity SSE event, and follow-up buttons are already handled by this result. Render the supplied scores and stop.");
+        yield return AIFunctionFactory.Create(GetCrawlMaturityEvidence, "GetCrawlMaturityEvidence", @"Collects and scores all seven Crawl maturity dimensions in ONE tool call: budgets/last evaluated spend, exact CostCenter/Owner/Environment tagging, exports, alerts/scheduled actions, policy guardrails, common waste, and cost visibility. Only complete assessments enter score history. It also returns ready-to-render fix actions. Low-cost metadata reads run with bounded server-side concurrency. Budget currentSpend is the last budget evaluation, not live Cost Analysis data; report it only as last evaluated spend with coverage, never as an authoritative live MTD total.
+    Use exactly once for Crawl/FinOps maturity scoring. Pass subscriptionsJson='all' for host discovery and automatic current-state selection (Enabled, Warned, PastDue), or an explicit JSON array for a user-selected subset. State exclusions are counted in scopeSelection and prevent an estate-complete claim; they do not imply zero historical costs or absent resources. Never copy a long context array or use shell tools. Evidence reads have a 30-second budget and reuse caller-isolated successful reads for five minutes. Results are compact with coverage and provisional scores for incomplete evidence; partial scores are not proof that controls are missing. Do NOT supplement it with QueryAzure, ReportMaturityScore, SuggestFollowUp, shell, file-reading, or any other tool—the score persistence, maturity SSE event, and follow-up buttons are already handled by this result. Render the supplied scores and stop.");
     }
 
     private async Task<string> GetCrawlMaturityEvidence(
@@ -52,13 +52,31 @@ public sealed class CrawlMaturityTools
         if (string.IsNullOrEmpty(token))
             return HttpHelper.TokenMissing("AzureToken", null, "crawl");
 
+        var excludedScopes = 0;
+        object scopeSelection = new { mode = "explicit", excluded = 0 };
         if (subscriptionsJson.Trim().Equals("all", StringComparison.OrdinalIgnoreCase))
         {
             var discovery = await AzureScopeDiscovery.SubscriptionsAsync(token);
             if (!discovery.Complete)
                 return JsonSerializer.Serialize(new { complete = false, source = "scopeDiscovery", error = discovery.Error,
                     guidance = "Subscription discovery is incomplete. No maturity score was calculated; retry discovery later." });
-            subscriptionsJson = JsonSerializer.Serialize(discovery.Scopes.Select(scope => new { id = scope.Id, name = scope.Name }));
+            var selected = discovery.Scopes.Where(scope =>
+                string.Equals(scope.State, "Enabled", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(scope.State, "Warned", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(scope.State, "PastDue", StringComparison.OrdinalIgnoreCase)).ToArray();
+            excludedScopes = discovery.Scopes.Count - selected.Length;
+            scopeSelection = new
+            {
+                mode = "currentState", discovered = discovery.Scopes.Count, selected = selected.Length,
+                excluded = excludedScopes,
+                excludedByState = discovery.Scopes.Except(selected).GroupBy(scope => scope.State ?? "Unknown")
+                    .ToDictionary(group => group.Key, group => group.Count()),
+                guidance = "Only Enabled, Warned and PastDue scopes are selected automatically. Other states are excluded, not proof of absent resources or historical costs. Use explicit scopes to assess an excluded readable subscription."
+            };
+            if (selected.Length == 0)
+                return JsonSerializer.Serialize(new { complete = false, source = "scopeSelection", scopeSelection,
+                    error = "No enabled, warned or past-due subscriptions were found; no score was calculated." });
+            subscriptionsJson = JsonSerializer.Serialize(selected.Select(scope => new { id = scope.Id, name = scope.Name }));
         }
         var (subscriptions, parseError) = ParseSubscriptions(subscriptionsJson);
         if (parseError is not null) return $"HTTP 400 BadRequest\n{parseError}";
@@ -88,16 +106,16 @@ public sealed class CrawlMaturityTools
         var collectionTask = Task.WhenAll(subscriptions.Select(async scope =>
         {
             var budget = ReadArmCollection(token,
-                $"/subscriptions/{scope.Id}/providers/Microsoft.Consumption/budgets?api-version=2024-08-01",
+                $"/subscriptions/{scope.Id}/providers/Microsoft.Consumption/budgets?api-version={AzureApiVersions.Budgets}",
                 "crawl.budgets", requestLimiter, cancellationToken);
             var exports = ReadArmCollection(token,
-                $"/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/exports?api-version=2026-08-01",
+                $"/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/exports?api-version={AzureApiVersions.CostExports}",
                 "crawl.exports", requestLimiter, cancellationToken);
             var actions = ReadArmCollection(token,
-                $"/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/scheduledActions?api-version=2025-03-01",
+                $"/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/scheduledActions?api-version={AzureApiVersions.ScheduledActions}",
                 "crawl.scheduled_actions", requestLimiter, cancellationToken);
             var alerts = ReadArmCollection(token,
-                $"/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/alerts?api-version=2026-08-01",
+                $"/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/alerts?api-version={AzureApiVersions.CostAlerts}",
                 "crawl.alerts", requestLimiter, cancellationToken);
             await Task.WhenAll(budget, exports, actions, alerts);
             return (Budget: CompactBudget(scope, budget.Result, currentMonthStart, utcToday),
@@ -185,8 +203,8 @@ public sealed class CrawlMaturityTools
             currencies.Length == 1 ? currencies[0] : null,
             totalsByCurrency);
         var scoreJson = JsonSerializer.Serialize(scores);
-        _saveScore("crawl", scoreJson);
-        var complete = scores.All(score => score.EvidenceComplete);
+        var complete = excludedScopes == 0 && scores.All(score => score.EvidenceComplete);
+        if (complete) _saveScore("crawl", scoreJson);
 
         var emptyGroups = DataRows(emptyGroupsTask.Result);
         var emptyGroupCount = emptyGroups.Sum(r => IntProperty(r, "emptyGroupCount"));
@@ -219,6 +237,8 @@ public sealed class CrawlMaturityTools
         {
             kind = "crawl_maturity_result",
             complete,
+            scopeSelection,
+            historyWriteRequested = complete,
             guidance = complete ? "Answer from the compact evidence; no more tools are required."
                 : "Provisional assessment: unread scopes are unknown, not missing controls. Use evidenceComplete on each score. Do not infer a complete estate rating or live cost total. No shell processing is required.",
             scores,

@@ -17,7 +17,8 @@ internal static class AzureScopeDiscovery
     private static readonly MemoryCache Cache = new(new MemoryCacheOptions { SizeLimit = 128 });
     private static readonly object CacheLock = new();
 
-    internal static Task<ScopeDiscoveryResult> SubscriptionsAsync(string token) => GetAsync(token, false);
+    internal static Task<ScopeDiscoveryResult> SubscriptionsAsync(string token, CancellationToken cancellationToken = default) =>
+        GetAsync(token, false, cancellationToken: cancellationToken);
     internal static Task<ScopeDiscoveryResult> ManagementGroupsAsync(string token) => GetAsync(token, true);
 
     private static HttpClient CreateClient()
@@ -27,8 +28,10 @@ internal static class AzureScopeDiscovery
         return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
     }
 
-    internal static async Task<ScopeDiscoveryResult> GetAsync(string token, bool managementGroups, HttpClient? http = null)
+    internal static async Task<ScopeDiscoveryResult> GetAsync(string token, bool managementGroups, HttpClient? http = null,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         // Cache by caller token, not tenant: users in the same tenant can see different subscriptions.
         var key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))) + ":" + managementGroups;
         Lazy<Task<ScopeDiscoveryResult>> pending;
@@ -45,8 +48,7 @@ internal static class AzureScopeDiscovery
                 });
             }
         }
-        var result = await pending.Value;
-        if (!result.Complete)
+        void EvictPending()
         {
             lock (CacheLock)
             {
@@ -54,7 +56,21 @@ internal static class AzureScopeDiscovery
                     Cache.Remove(key);
             }
         }
-        return result;
+        try
+        {
+            var result = await pending.Value.WaitAsync(cancellationToken);
+            if (!result.Complete) EvictPending();
+            return result;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested && !pending.Value.IsCompleted)
+        {
+            throw;
+        }
+        catch
+        {
+            EvictPending();
+            throw;
+        }
     }
 
     internal static async Task<ScopeDiscoveryResult> ReadPagesAsync(HttpClient http, string token, bool managementGroups)

@@ -356,10 +356,7 @@ public static class ChatEndpoints
             ctx.Response.Headers.Connection = "keep-alive";
             ctx.Response.Headers["X-Accel-Buffering"] = "no";
 
-            // Declared outside the try so the finally block can deterministically
-            // remove this exact turn's reporter (sweeping by userId prefix would
-            // clobber a concurrent turn in another tab).
-            string? turnKey = null;
+            using var retryReporter = new Infrastructure.RetryReporterRegistration();
             string? turnGateSessionId = null;
             // Detaches the streaming subscriptions. Declared out here so it is
             // visible in the finally; (re)assigned by WireHandlers inside the try.
@@ -368,6 +365,11 @@ public static class ChatEndpoints
             // finally, because the HttpContext is pooled and reused once the
             // turn ends (see the finally for why that matters).
             var streamDetached = 0;
+            using var abortRegistration = ctx.RequestAborted.Register(() =>
+            {
+                Interlocked.Exchange(ref streamDetached, 1);
+                retryReporter.Dispose();
+            });
             ActiveTurnState? turnState = null;
             try
             {
@@ -501,13 +503,6 @@ public static class ChatEndpoints
                 // result via LoadTranscriptAsync. Without this detach, closing
                 // the tab during a long "score my estate" run would silently
                 // kill the work mid-flight.
-                ctx.RequestAborted.Register(() =>
-                {
-                    Interlocked.Exchange(ref streamDetached, 1);
-                    if (turnKey is not null)
-                        Infrastructure.HttpHelper.RetryReporters.TryRemove(turnKey, out _);
-                });
-
                 // SSE write lock + emit helper — declared up here so the
                 // session.On callback below can use SafeEmit for the
                 // sdk.first_event timing ping.
@@ -525,8 +520,7 @@ public static class ChatEndpoints
                     catch (Exception ex) when (IsClientDisconnect(ex))
                     {
                         Interlocked.Exchange(ref streamDetached, 1);
-                        if (turnKey is not null)
-                            Infrastructure.HttpHelper.RetryReporters.TryRemove(turnKey, out _);
+                        retryReporter.Dispose();
                     }
                     finally { sseLock.Release(); }
                 }
@@ -652,24 +646,18 @@ public static class ChatEndpoints
                 // Wire the retry hook so HttpHelper can push "Cooling down" pings
                 // to this SSE stream during 429 backoff. The sseLock / SafeEmit
                 // were declared above so the subscription callback can share them.
-                // Register the SSE retry hook keyed by *turn id* (userId:sessionId)
-                // — NOT just userId — so concurrent turns from the same user
-                // (two tabs, sidebar score racing chat) don't clobber each
-                // other's reporter. Propagated to all child activities (incl.
-                // across the Copilot CLI JSON-RPC tool-callback boundary) via
-                // Activity Baggage. Earlier we tried AsyncLocal and Activity.RootId
-                // — both failed to flow through that boundary; baggage does.
-                turnKey = $"{userId}:{activeSessionId}";
-                chatActivity?.SetBaggage("finops.turn.id", turnKey);
-                Infrastructure.HttpHelper.RetryReporters[turnKey] = (attempt, waitSec, url, tool, status) =>
+                void BindRetryReporter(string sessionId)
                 {
-                    logger.LogInformation("EMIT cooling_down sse turn={Turn} attempt={Attempt} status={Status} tool={Tool} waitSec={Wait:F1}",
-                        turnKey, attempt, status, tool, waitSec);
-                    return SafeEmit(JsonSerializer.Serialize(new { type = "cooling_down", attempt, waitSeconds = waitSec, url, tool, status }));
-                };
-                // Belt-and-braces cleanup on request abort.
-                var turnKeyForAbort = turnKey;
-                ctx.RequestAborted.Register(() => Infrastructure.HttpHelper.RetryReporters.TryRemove(turnKeyForAbort, out _));
+                    var boundKey = $"{userId}:{sessionId}";
+                    chatActivity?.SetBaggage("finops.turn.id", boundKey);
+                    retryReporter.Bind(boundKey, (attempt, waitSec, url, tool, status) =>
+                    {
+                        logger.LogInformation("EMIT cooling_down sse turn={Turn} attempt={Attempt} status={Status} tool={Tool} waitSec={Wait:F1}",
+                            boundKey, attempt, status, tool, waitSec);
+                        return SafeEmit(JsonSerializer.Serialize(new { type = "cooling_down", attempt, waitSeconds = waitSec, url, tool, status }));
+                    });
+                }
+                BindRetryReporter(activeSessionId);
 
                 try
                 {
@@ -697,6 +685,7 @@ public static class ChatEndpoints
                     }
                     activeSessionId = session.SessionId;
                     handlers = WireHandlers(session);
+                    BindRetryReporter(activeSessionId);
                     // Re-announce the (possibly new) session id so the frontend keeps
                     // streaming into the right conversation.
                     await SafeEmit(JsonSerializer.Serialize(new { type = "session", id = activeSessionId }));
@@ -860,8 +849,7 @@ public static class ChatEndpoints
                 // Release this turn's reporter only — never sweep by userId
                 // prefix, since a concurrent turn from the same user (two tabs,
                 // sidebar score racing chat) holds its own key in the dict.
-                if (turnKey is not null)
-                    Infrastructure.HttpHelper.RetryReporters.TryRemove(turnKey, out _);
+                retryReporter.Dispose();
                 if (turnGateSessionId is not null)
                     EndTurn(turnGateSessionId);
                 // Also releases a state orphaned by a failed MoveTurn, so a

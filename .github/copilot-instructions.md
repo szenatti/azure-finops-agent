@@ -28,6 +28,8 @@ The SDK and bundled Copilot CLI are one compatibility unit. Let the installed `G
 - Session state is persisted under `COPILOT_HOME`; Entra users are isolated by OID and anonymous users by generated user ID.
 - One `SemaphoreSlim` gate per user serializes session create/resume/replay. Do not bypass it: warmup and transcript replay otherwise race into `Session ... is already tracked`.
 - One active turn per session is enforced by `ChatEndpoints`; scheduled jobs use the same turn gate.
+- Tool definitions remain cached per user, but every create/resume registers fresh `SessionBoundTool` wrappers for the verified host user and exact session. They restore `finops.turn.id` locally at callback entry; do not rely on Activity/AsyncLocal propagation through the Copilot CLI. Never derive this identity from model arguments or fall back to another session's reporter. Session recycling must rebind the exact SSE retry key. Preserve tool schemas and deferred-tool metadata.
+- Before registering a created/resumed session, verify that the SDK returned the exact host-requested session ID; dispose mismatches and fail closed. Retry reporter binding/disposal is lock-owned, permanently detached on disconnect, and removes only its own delegate. Keep one disposable request-abort registration, not one per rebind.
 - SSE streams deltas, reasoning, timing, tools, charts, generated files, scores, cooldowns, busy/errors, and completion.
 - The backend continues a turn after browser disconnect and persists the answer. The frontend reconciles against the server turn gate and transcript.
 - OAuth access tokens stay in memory. Only the encrypted refresh-token identity record is persisted.
@@ -82,6 +84,8 @@ Before manually testing a fresh consent flow, revoke existing grants for the tes
 ## Tool patterns
 
 - Tools fetch data and return compact raw API JSON unless a bounded projection is explicitly required for performance.
+- Transport responses from `HttpHelper` use an HTTP-status-line followed by a body. Composite cost/discovery/Crawl results use structured JSON, not a synthetic HTTP response; existing validation/authentication errors can be HTTP-prefixed. Only feed transport responses to HTTP parsers. Crawl success JSON must remain directly parseable by the SSE handler.
+- Server-built cost/Crawl requests and QueryAzure guidance use endpoint-specific `AzureApiVersions` constants, verified against each operation's REST reference. Do not rewrite an explicitly supplied raw QueryAzure API version. Reference links and offline checks are in `tests/LargeTenant.RegressionTests/README.md`.
 - XLSX `workbook` inspection returns every sheet's shape, columns, and bounded numeric summaries in one call; reuse it instead of making a second aggregate call when the requested metric is already present.
 - Prefer string parameters; SDK coercion of numeric arguments can be unreliable.
 - Reuse one `CosmosClient`/HTTP client/session where applicable; do not create clients per request.
@@ -89,11 +93,14 @@ Before manually testing a fresh consent flow, revoke existing grants for the tes
 - Push aggregation, filtering, grouping, and limits into the source API.
 - Parallelize independent calls, except Cost Management `/query` and `/forecast`, which are tenant-throttled.
 - Never issue multiple Cost Management query calls in parallel. After a final 429, stop querying that service for the turn.
+- Cost Management query/forecast POSTs to the public ARM HTTPS endpoint carry the fixed, host-owned `ClientType: AzureFinOpsAgent`. Do not impersonate Portal clients, rotate the value per request/user/retry, or derive it from model arguments. Header overrides are rejected. This identifies the application; it does not guarantee quota availability. Preserve existing authentication, request bodies, API versions, pacing, and cooldowns when testing this behavior.
 - Cost query/forecast requests share a tenant-keyed semaphore, one-second spacing, and cooldown across users, turns, and scheduled jobs in the same process. Tenant claims are used only for throttle bucketing, never authorization. Honor the longest positive standard or Cost Management/Consumption retry hint; return long cooldowns instead of shortening them. Multi-instance hosting needs distributed rate/cooldown coordination.
+- Positive server retry hints remain tenant-shared. A headerless inferred fallback is isolated by hashed caller token so it does not block unrelated principals. Checking an existing cooldown never renews its expiry.
 - Every 429 includes a `finopsRetry` JSON object with retry time, delay source, and Azure-versus-local-cooldown source. Do not rely on text before the JSON body: the execution panel's JSON formatter omits it. Headerless cost-query throttles use a labelled 60-second fallback and no rapid retry; this is not a guarantee of quota availability.
 - Azure 429 results include bounded, explicitly allow-listed `finopsRetry.rateLimitHeaders` for diagnosing the exhausted quota. Never copy arbitrary response headers, authorization, or cookies into diagnostics. Local cooldowns have no new server headers.
-- Successful cost-query responses are cached for five minutes under hashed caller-token + request keys, never across principals. Preserve fetch-time guidance and the HTTP-status-line + JSON-body contract.
+- Successful cost-query responses are cached for five minutes under hashed caller-token + request keys, never across principals. Check before the tenant gate and again after acquiring it; a warm cache hit must not wait behind another user's request. Preserve fetch-time guidance and the HTTP-status-line + JSON-body contract.
 - Scope discovery follows subscription and management-group pages with same-host/path HTTPS continuation validation, a five-minute caller-token-isolated cache, and explicit incomplete flags. Use `FindSubscriptions` for bounded name/id resolution, never shell parsing of ARM inventory. Cache/prompt bounds are not proof that all scopes were discovered.
+- Evict faulted/incomplete discovery tasks. Cancellation of one waiter must not evict or cancel shared pending discovery for other callers. Cross-subscription cost cancellation propagates through discovery waiting, gate waits, retries, HTTP requests and the subscription loop.
 
 ### Cross-subscription cost
 
@@ -101,7 +108,9 @@ Use `QueryCostsAcrossSubscriptions` exactly once for all-subscription totals.
 
 - Pass `subscriptionsJson='all'` to resolve all accessible scopes server-side; explicit arrays select a subset. Never treat a truncated connection-context array as the entire estate.
 - It tries one supplied, verified containing management-group query, then at most 20 sequential subscription queries. Larger estates need a supported aggregate scope or Cost Management exports. Paginated cost responses cannot be accepted as complete totals.
+- Management-group HTTP 400/403/404 permit the bounded child fallback; authentication, server and throttle failures stop immediately. Historical cost discovery retains all subscription states, prioritizing Enabled/Warned scopes without silently dropping disabled/deleted scopes.
 - Results preserve complete/failed/unattempted counts with at most 50 detail rows. Partial data never produces a complete estate total.
+- Empty cost rows are `noData`, not measured zero; count them separately from failures. A measured zero needs an explicit row and a known currency. No-data or empty estate results cannot produce a complete zero total.
 - Budget `currentSpend` is the last evaluated cost, not live Cost Analysis data and not a service breakdown. Never substitute it for authoritative costs; empty budgets do not mean zero spend.
 - Do not list subscriptions again; reuse connection metadata or the host discovery cache.
 
@@ -110,10 +119,10 @@ Use `QueryCostsAcrossSubscriptions` exactly once for all-subscription totals.
 Use `GetCrawlMaturityEvidence` exactly once for explicit Crawl scoring.
 
 - It runs budget/current-spend, required-tag, exports, alert/scheduled-action, policy, common-waste, and empty-resource-group checks concurrently.
-- Pass `subscriptionsJson='all'` for host-side discovery; explicit arrays select a subset. Do not copy a large connection-context array. The legacy management-group argument is not a scope filter or an inherited-policy audit.
+- Pass `subscriptionsJson='all'` for host-side discovery and automatic current-state selection (Enabled, Warned, PastDue); other states are explicitly counted as exclusions and prevent an estate-complete claim. Exclusion is not evidence of absent resources or zero historical cost. Explicit arrays select a subset, including excluded readable subscriptions when requested. Do not copy a large connection-context array. The legacy management-group argument is not a scope filter or an inherited-policy audit.
 - Evidence reads have a shared 30-second deadline after discovery, a 12-request concurrency cap, and interleaved collection categories. Queued and in-flight work must respect cancellation. Successful reads cache for five minutes under caller-token/request hashes; incomplete results are explicitly provisional, never proof of absent controls.
 - Compute scores using all collected evidence, but return aggregate counts and at most three samples per category. Preserve the `kind`, `scores`, and `followUp` SSE contract. Never send the full per-subscription evidence to the model or ask it to shell-parse Crawl results.
-- It computes and persists all seven scores and returns follow-up actions.
+- It computes all seven scores and returns follow-up actions, but only complete assessments enter history. `historyWriteRequested` indicates the persistence request, not disk-write success. History comparisons skip entries explicitly marked incomplete; legacy entries without completeness metadata remain readable.
 - Each score carries `evidenceComplete`; the top-level `complete` flag describes collection completeness. Policy evidence remains a metadata keyword scan, not a definition/effect audit. Empty resource groups are hygiene findings, not billable resources or quantified savings.
 - Budget-based spend evidence is explicitly labeled last evaluated, with coverage and unknown evaluation time; it is not live MTD cost.
 - `ChatEndpoints` emits `maturity_score` and `follow_up` directly.
@@ -215,7 +224,9 @@ Do not deploy without explicit user instruction. When instructed, validate build
 
 ## Observability
 
-The collector caps trace resource, span, and span-event string attributes at 4096 before Azure Monitor export, below its 8192-character property limit. This affects telemetry copies only, not model input, tool results, or persisted chat. Numeric fields and span identity/timing/status remain intact. Truncated JSON attributes are diagnostic excerpts, not complete documents; truncation is not secret redaction. Keep the transform before batching and validate it with the collector release pinned in the Dockerfile.
+The collector caps trace resource, span, span-event, log resource and log-record string attributes at 4096 before Azure Monitor export, below its 8192-character property limit. This affects telemetry copies only, not model input, tool results, persisted chat or log bodies. Numeric fields and trace/log identity/timing/status remain intact; metrics are unchanged. Truncated JSON attributes are diagnostic excerpts, not complete documents; truncation is not secret redaction. Keep the transform before batching and validate it with the collector release pinned in the Dockerfile. Run `node tests/collector-regression.mjs /path/to/otelcol-contrib` for offline behavior checks (Node and Ruby required).
+
+The collector is pinned to 0.160.0. A dependency scan is required when changing it; a newer release is not proof of zero vulnerabilities. The validation README records remaining findings. The offline harness uses separate file exporters per signal to avoid the 0.160.0 shared-file shutdown race; production continues to use Azure Monitor.
 
 The image build runs `otelcol validate` against the exact Linux collector and configuration it packages, using a generated test instrumentation key and loopback endpoint. This checks configuration without starting the collector or contacting Azure. Do not bypass this build gate or supply real credentials to it.
 
