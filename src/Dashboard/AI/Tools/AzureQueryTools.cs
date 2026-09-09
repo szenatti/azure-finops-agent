@@ -29,6 +29,13 @@ public class AzureQueryTools
     // repeated call resume where the previous one stopped instead of re-querying the same head.
     internal static TimeSpan InteractiveCostScopeBudget = TimeSpan.FromSeconds(90);
 
+    // Cost Management dimensions this tool will group by; anything else is rejected before the call.
+    internal static readonly string[] CostGroupDimensions =
+    {
+        "ServiceName", "ResourceGroupName", "MeterCategory", "MeterSubCategory",
+        "ResourceLocation", "ResourceType", "ChargeType", "PublisherType", "SubscriptionName"
+    };
+
     private readonly UserTokens _tokens;
     private readonly HttpClient? _http;
 
@@ -57,8 +64,8 @@ Use standard ARM URL conventions; you know the resource providers and current ap
 Never bare /providers/Microsoft.CostManagement/... — that returns 400.
 
 COST MANAGEMENT QUERY: use api-version=" + AzureApiVersions.CostQuery + @". ALWAYS group by a real dimension (ServiceName, ResourceGroupName, MeterCategory). Do NOT add 'UsageDate' to the grouping array — it's a response column, not a dimension; use granularity=""Daily"" for per-day. Never request raw ungrouped cost data. For a plain total across all subscriptions, use QueryCostsAcrossSubscriptions with subscriptionsJson='all'; never fan out one query per subscription. Budget currentSpend is last evaluated spend, NOT live cost and NOT a service breakdown. GET /subscriptions returns a compact page; use FindSubscriptions for name resolution.
-SPIKE / TREND / REGION / SERVICE QUESTIONS: do NOT use QueryCostsAcrossSubscriptions — it returns one undifferentiated total per subscription. Issue ONE query here at the narrowest scope that covers the question, with granularity=""Daily"" for a per-day series and dataset.filter for dimensions. Region example: {""dimensions"":{""name"":""ResourceLocation"",""operator"":""In"",""values"":[""East US"",""West US 2""]}}. Grouping accepts at most 2 dimensions. ResourceLocation values are Cost Management's own labels; if a region filter returns no rows, re-run grouped by ResourceLocation to read the actual values instead of guessing, and report zero rows as unknown, never as zero spend.
-MANAGEMENT-GROUP SCOPE: NEVER use a management group — including the tenant root group — as a stand-in for 'all subscriptions'. A rollup silently OMITS every subscription Cost Management cannot aggregate for this caller (documented behaviour for CSP subscriptions) and returns HTTP 200 for the remainder, so a small total is indistinguishable from a complete one. Answer estate-wide questions with QueryCostsAcrossSubscriptions using subscriptionsJson='all', or a billing-account scope. Management-group scope is unsupported for Microsoft Customer Agreement and CSP accounts, and even on an Enterprise Agreement it can return 'Management group ... does not have any valid subscriptions' when the group holds no subscriptions Cost Management can aggregate for this caller. That is a deterministic HTTP 400, never a throttle: do not retry it, fall back to subscription scope and say the aggregate was unavailable. Management-group totals cover usage charges only and EXCLUDE reservations, savings plans and Marketplace purchases, so they are not comparable with billing-account totals; state the scope and both exclusions whenever you report one.
+SPIKE / TREND QUESTIONS: do NOT use QueryCostsAcrossSubscriptions for a per-day series — it has no daily granularity. Issue ONE query here at the narrowest scope that covers the question, with granularity=""Daily"" for a per-day series and dataset.filter for dimensions. Region example: {""dimensions"":{""name"":""ResourceLocation"",""operator"":""In"",""values"":[""East US"",""West US 2""]}}. Grouping accepts at most 2 dimensions. ResourceLocation values are Cost Management's own labels; if a region filter returns no rows, re-run grouped by ResourceLocation to read the actual values instead of guessing, and report zero rows as unknown, never as zero spend. For a SERVICE / RESOURCE-GROUP / REGION BREAKDOWN ACROSS MANY SUBSCRIPTIONS, use QueryCostsAcrossSubscriptions with its groupBy parameter instead of querying one scope here.
+MANAGEMENT-GROUP SCOPE: NEVER use a management group — including the tenant root group — as a stand-in for 'all subscriptions'. A rollup silently OMITS every subscription Cost Management cannot aggregate for this caller (documented behaviour for CSP subscriptions) and returns HTTP 200 for the remainder, so a small total is indistinguishable from a complete one. Answer estate-wide questions with QueryCostsAcrossSubscriptions using subscriptionsJson='all' — that tool needs no billing-account access and is ALWAYS available, so never refuse an estate-wide question because no billing account is accessible. Management-group scope is unsupported for Microsoft Customer Agreement and CSP accounts, and even on an Enterprise Agreement it can return 'Management group ... does not have any valid subscriptions' when the group holds no subscriptions Cost Management can aggregate for this caller. That is a deterministic HTTP 400, never a throttle: do not retry it, fall back to subscription scope and say the aggregate was unavailable. Management-group totals cover usage charges only and EXCLUDE reservations, savings plans and Marketplace purchases, so they are not comparable with billing-account totals; state the scope and both exclusions whenever you report one.
 OTHER COST API VERSIONS: forecast=" + AzureApiVersions.CostForecast + "; exports=" + AzureApiVersions.CostExports + "; alerts=" + AzureApiVersions.CostAlerts + "; scheduledActions=" + AzureApiVersions.ScheduledActions + "; Consumption budgets=" + AzureApiVersions.Budgets + @". Each endpoint has its own supported version; do not invent a newer one. Preserve versions explicitly requested for controlled comparisons.
 
 THROTTLING: Cost Management /query and /forecast are aggressively throttled per-tenant. Interactive queries make at most one short retry; other transient calls retain the standard retry policy. Do NOT call multiple CostManagement endpoints in parallel from the same turn — Resource Graph and Advisor parallelize fine. If a call still returns HTTP 429, do not make another Cost Management call in the same turn; report the throttle and offer to retry later.
@@ -75,8 +82,8 @@ CONSUMPTION DEPRECATIONS: usageDetails → use Microsoft.CostManagement/generate
 
 For public retail pricing use https://prices.azure.com (no auth) with ?$filter=armRegionName eq '...' and serviceName eq '...' and armSkuName eq '...'&$top=20.");
 
-        yield return AIFunctionFactory.Create(QueryCostsAcrossSubscriptions, "QueryCostsAcrossSubscriptions", @"Gets a PLAIN COST TOTAL per subscription, plus coverage counts and up to 50 subscription details, in ONE agent tool call. Use this only when the question is 'how much did we spend' across many subscriptions; never loop QueryAzure yourself. Cached results may be up to five minutes old and Azure cost ingestion may lag usage.
-LIMITS — this tool queries with granularity 'None' and NO dimension filter, so it returns a single number per subscription for the whole window. It CANNOT answer questions about daily series, spikes, trends, regions, services, meters or resource groups. For any of those, issue ONE scoped QueryAzure Cost Management query with granularity='Daily' and/or dataset.filter instead of calling this tool.
+        yield return AIFunctionFactory.Create(QueryCostsAcrossSubscriptions, "QueryCostsAcrossSubscriptions", @"Gets COST TOTALS across many subscriptions in ONE agent tool call, optionally broken down by a dimension, plus coverage counts and up to 50 subscription details. Use this whenever the question is 'how much did we spend' across more than one subscription; never loop QueryAzure yourself. It needs no billing-account access, so never refuse an estate-wide question because no billing account is available. Cached results may be up to five minutes old and Azure cost ingestion may lag usage.
+GROUPING — set groupBy to break the estate total down: ServiceName, ResourceGroupName, MeterCategory, MeterSubCategory, ResourceLocation, ResourceType, ChargeType, PublisherType or SubscriptionName. The `byGroup` array then holds the cross-subscription totals per group and currency, cheapest field to chart. Omit groupBy for a plain total per subscription. groupBy has no daily granularity; route per-day series to a single scoped QueryAzure query instead. Supplying groupBy disables the management-group aggregate shortcut.
 Input subscriptionsJson: 'all' for all accessible subscriptions (discovered by the host, never copy a truncated context list), or an explicit JSON array of selected {id,name} scopes. Input managementGroupId: an optional verified containing management group. Dates are yyyy-MM-dd; `to` is the exclusive end date.
     Uses Cost Management only, never budget evaluations as a live-cost substitute. It tries one supplied management-group aggregate, then queries subscriptions sequentially until a wall-clock budget is reached. Already-queried subscriptions are cached for five minutes and replay instantly, so on a large estate calling this tool again within that window RESUMES from where it stopped — repeat until `unattempted` reaches 0, reporting coverage each time. Stops immediately on throttling; reports partial coverage and unattempted scopes, never a complete total for partial data. On HTTP 429 the `retry` field names the Azure quota that fired — report it verbatim. Never call this tool twice in one turn after a 429.");
 
@@ -181,6 +188,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
         [Description("Inclusive start date in yyyy-MM-dd format")] string from,
         [Description("Exclusive end date in yyyy-MM-dd format")] string to,
         [Description("Optional management-group id or full ARM path from the connection context")] string? managementGroupId = null,
+        [Description("Optional Cost Management dimension to break the total down by, e.g. ServiceName or ResourceGroupName. Omit for a plain total per subscription.")] string? groupBy = null,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -246,6 +254,15 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
         if (scopes.Count == 0)
             return "HTTP 400 BadRequest\nsubscriptionsJson contained no valid subscription IDs.";
 
+        string? groupDimension = null;
+        if (!string.IsNullOrWhiteSpace(groupBy))
+        {
+            groupDimension = CostGroupDimensions.FirstOrDefault(
+                dimension => dimension.Equals(groupBy.Trim(), StringComparison.OrdinalIgnoreCase));
+            if (groupDimension is null)
+                return $"HTTP 400 BadRequest\ngroupBy must be one of: {string.Join(", ", CostGroupDimensions)}.";
+        }
+
         var body = JsonSerializer.Serialize(new
         {
             type = "ActualCost",
@@ -255,11 +272,18 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
                 from = fromDate.ToString("yyyy-MM-dd"),
                 to = toDate.ToString("yyyy-MM-dd")
             },
-            dataset = new
-            {
-                granularity = "None",
-                aggregation = new { totalCost = new { name = "Cost", function = "Sum" } }
-            }
+            dataset = groupDimension is null
+                ? new
+                {
+                    granularity = "None",
+                    aggregation = new { totalCost = new { name = "Cost", function = "Sum" } }
+                }
+                : (object)new
+                {
+                    granularity = "None",
+                    aggregation = new { totalCost = new { name = "Cost", function = "Sum" } },
+                    grouping = new[] { new { type = "Dimension", name = groupDimension } }
+                }
         });
 
         Dictionary<string, CostScopeResult>? aggregateResults = null;
@@ -268,7 +292,8 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
         // Prefer one aggregate call. An accessible management group is not
         // guaranteed to contain the delegated subscriptions, so only 400/403/404
         // fall back; a 429 must stop immediately to protect the tenant quota.
-        if (!string.IsNullOrWhiteSpace(managementGroupId))
+        // The aggregate groups by subscription, so it cannot serve a dimension breakdown.
+        if (!string.IsNullOrWhiteSpace(managementGroupId) && groupDimension is null)
         {
             var mgName = managementGroupId.Trim().TrimEnd('/').Split('/').Last();
             if (mgName.Length > 0)
@@ -338,6 +363,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
         var throttled = false;
         JsonNode? throttleDiagnostics = null;
         var budget = Stopwatch.StartNew();
+        var groupTotals = groupDimension is null ? null : new Dictionary<(string Group, string Currency), double>();
 
         for (var i = 0; i < remainingScopes.Count; i++)
         {
@@ -355,11 +381,33 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
                 method: HttpMethod.Post, jsonBody: body, cancellationToken: cancellationToken);
 
             string? parseError = null;
-            if (response.StartsWith("HTTP 200", StringComparison.Ordinal)
-                && TryReadCost(response, out var cost, out var currency, out parseError))
+            if (response.StartsWith("HTTP 200", StringComparison.Ordinal))
             {
-                resultsById[scope.Id] = new(scope.Id, scope.Name, 200, cost, currency, null);
-                continue;
+                if (groupDimension is null)
+                {
+                    if (TryReadCost(response, out var cost, out var currency, out parseError))
+                    {
+                        resultsById[scope.Id] = new(scope.Id, scope.Name, 200, cost, currency, null);
+                        continue;
+                    }
+                }
+                else if (TryReadCostRows(response, groupDimension, out var costRows, out parseError))
+                {
+                    foreach (var costRow in costRows)
+                    {
+                        var key = (costRow.Group ?? "(unattributed)", costRow.Currency);
+                        groupTotals![key] = groupTotals.TryGetValue(key, out var running)
+                            ? running + costRow.Cost : costRow.Cost;
+                    }
+                    var scopeCurrencies = costRows
+                        .Select(costRow => costRow.Currency)
+                        .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    resultsById[scope.Id] = new(scope.Id, scope.Name, 200,
+                        costRows.Sum(costRow => costRow.Cost),
+                        scopeCurrencies.Count == 1 ? scopeCurrencies[0] : null,
+                        null);
+                    continue;
+                }
             }
 
             var status = ParseStatusCode(response);
@@ -390,7 +438,8 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
         }
 
         var source = reusedAggregateResults ? "managementGroup+subscriptions" : "subscriptions";
-        return BuildCostResponse(source, scopes, resultsById, throttled, throttleDiagnostics, managementGroupError);
+        return BuildCostResponse(source, scopes, resultsById, throttled, throttleDiagnostics, managementGroupError,
+            groupTotals, groupDimension);
     }
 
     internal static BudgetSpend ReadUnfilteredBudgetSpend(
@@ -567,7 +616,9 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
         IReadOnlyDictionary<string, CostScopeResult> resultsById,
         bool throttled,
         JsonNode? retry = null,
-        string? managementGroupError = null)
+        string? managementGroupError = null,
+        IReadOnlyDictionary<(string Group, string Currency), double>? groupTotals = null,
+        string? groupedBy = null)
     {
         var orderedResults = scopes.Select(scope =>
             resultsById.TryGetValue(scope.Id, out var result)
@@ -607,6 +658,17 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
             partialCost = !complete && safeAggregate && succeeded > 0 ? Math.Round(summedCost!.Value, 6) : (double?)null,
             currency = singleCurrency,
             totalsByCurrency,
+            groupedBy,
+            byGroupTruncated = groupTotals is not null && groupTotals.Count > 100,
+            byGroup = groupTotals?
+                .OrderByDescending(entry => entry.Value)
+                .Take(100)
+                .Select(entry => new
+                {
+                    group = entry.Key.Group,
+                    currency = entry.Key.Currency,
+                    cost = Math.Round(entry.Value, 6)
+                }),
             results = orderedResults.OrderBy(result => result.Status == 200 && result.Cost is not null ? 0 : result.Status != 0 ? 1 : 2)
                 .ThenByDescending(result => result.Cost ?? 0).Take(50).Select(r => new
             {
@@ -626,6 +688,21 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
     {
         cost = 0;
         currency = null;
+        if (!TryReadCostRows(response, null, out var rows, out error)) return false;
+        var currencies = rows.Select(row => row.Currency).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (currencies.Count > 1)
+        {
+            error = "Cost response contained more than one currency.";
+            return false;
+        }
+        cost = rows.Sum(row => row.Cost);
+        currency = currencies.Single();
+        return true;
+    }
+
+    private static bool TryReadCostRows(string response, string? groupBy, out List<CostRow> rows, out string? error)
+    {
+        rows = new List<CostRow>();
         error = null;
         try
         {
@@ -641,14 +718,14 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
                 .ToDictionary(x => x.Name, x => x.Index, StringComparer.OrdinalIgnoreCase);
             var costIndex = columns.TryGetValue("Cost", out var ci) ? ci : columns["PreTaxCost"];
             var currencyIndex = columns.TryGetValue("Currency", out var cui) ? cui : -1;
-            var currencies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var rows = props.GetProperty("rows");
-            if (rows.GetArrayLength() == 0)
+            var groupIndex = groupBy is not null && columns.TryGetValue(groupBy, out var gi) ? gi : -1;
+            var rowsElement = props.GetProperty("rows");
+            if (rowsElement.GetArrayLength() == 0)
             {
                 error = NoCostRows;
                 return false;
             }
-            foreach (var row in rows.EnumerateArray())
+            foreach (var row in rowsElement.EnumerateArray())
             {
                 var rowCost = row[costIndex].GetDouble();
                 if (!double.IsFinite(rowCost))
@@ -656,28 +733,20 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
                     error = "Cost response contained a non-finite value.";
                     return false;
                 }
-                cost += rowCost;
-                if (currencyIndex >= 0)
+                var rowCurrency = currencyIndex >= 0 ? row[currencyIndex].GetString() : null;
+                if (string.IsNullOrWhiteSpace(rowCurrency))
                 {
-                    var rowCurrency = row[currencyIndex].GetString();
-                    if (!string.IsNullOrWhiteSpace(rowCurrency)) currencies.Add(rowCurrency);
+                    error = "Cost response omitted currency.";
+                    return false;
                 }
+                var group = groupIndex >= 0 ? row[groupIndex].GetString() : null;
+                rows.Add(new CostRow(string.IsNullOrWhiteSpace(group) ? null : group, rowCost, rowCurrency));
             }
-            if (currencies.Count > 1)
-            {
-                error = "Cost response contained more than one currency.";
-                return false;
-            }
-            if (currencies.Count != 1)
-            {
-                error = "Cost response omitted currency.";
-                return false;
-            }
-            currency = currencies.Count == 1 ? currencies.Single() : null;
             return true;
         }
         catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
         {
+            rows.Clear();
             error = ex.Message;
             return false;
         }
@@ -729,6 +798,8 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
         double? Cost,
         string? Currency,
         string? Error);
+
+    internal sealed record CostRow(string? Group, double Cost, string Currency);
 
     private sealed record AggregateCostResult(
         Dictionary<string, CostScopeResult> Results,

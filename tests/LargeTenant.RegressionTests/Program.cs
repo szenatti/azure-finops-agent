@@ -483,6 +483,54 @@ try
 }
 finally { AzureQueryTools.InteractiveCostScopeBudget = restoreBudget; }
 
+// A service breakdown across many subscriptions must come from this tool, not a management-group
+// rollup and not a per-subscription fan-out, so grouped rows aggregate across scopes.
+var groupToken = Token(Guid.NewGuid(), "group-test");
+using var groupHttp = new HttpClient(new StubHandler(request =>
+    request.RequestUri!.AbsolutePath.EndsWith("/query", StringComparison.OrdinalIgnoreCase)
+        ? JsonResponse(new
+        {
+            properties = new
+            {
+                columns = new object[] { new { name = "Cost" }, new { name = "ServiceName" }, new { name = "Currency" } },
+                rows = new object[] { new object[] { 10.5, "Storage", "AUD" }, new object[] { 4.5, "Virtual Machines", "AUD" } }
+            }
+        })
+        : JsonResponse(new { value = subscriptionIds.Take(3).Select((id, index) => new
+        {
+            subscriptionId = id, displayName = "Grouped-" + index, state = "Enabled"
+        }) })));
+await AzureScopeDiscovery.GetAsync(groupToken, false, groupHttp);
+var groupTools = new AzureQueryTools(new UserTokens { AzureToken = groupToken }, groupHttp).Create().ToDictionary(tool => tool.Name);
+var grouped = await Invoke(groupTools["QueryCostsAcrossSubscriptions"], new AIFunctionArguments
+{
+    ["subscriptionsJson"] = "all", ["from"] = new DateOnly(today.Year, today.Month, 1).ToString("yyyy-MM-dd"),
+    ["to"] = today.AddDays(1).ToString("yyyy-MM-dd"), ["groupBy"] = "servicename"
+});
+using (var breakdown = JsonDocument.Parse(grouped))
+{
+    var root = breakdown.RootElement;
+    var byGroup = root.GetProperty("byGroup").EnumerateArray()
+        .ToDictionary(row => row.GetProperty("group").GetString()!, row => row.GetProperty("cost").GetDouble());
+    Check(root.GetProperty("groupedBy").GetString() == "ServiceName" && byGroup.Count == 2
+        && Math.Abs(byGroup["Storage"] - 31.5) < 0.000001
+        && Math.Abs(byGroup["Virtual Machines"] - 13.5) < 0.000001,
+        "Grouped cross-subscription costs aggregate each dimension across every subscription");
+    Check(root.GetProperty("complete").GetBoolean() && root.GetProperty("succeeded").GetInt32() == 3
+        && Math.Abs(root.GetProperty("totalCost").GetDouble() - 45.0) < 0.000001,
+        "Grouping preserves per-subscription coverage accounting and the estate total");
+}
+var badDimension = await Invoke(groupTools["QueryCostsAcrossSubscriptions"], new AIFunctionArguments
+{
+    ["subscriptionsJson"] = "all", ["from"] = new DateOnly(today.Year, today.Month, 1).ToString("yyyy-MM-dd"),
+    ["to"] = today.AddDays(1).ToString("yyyy-MM-dd"), ["groupBy"] = "DROP TABLE"
+});
+Check(badDimension.StartsWith("HTTP 400") && badDimension.Contains("ServiceName"),
+    "Unknown grouping dimensions are rejected before any Cost Management call");
+Check(groupTools["QueryCostsAcrossSubscriptions"].Description.Contains("never refuse an estate-wide question")
+    && groupTools["QueryAzure"].Description.Contains("ALWAYS available"),
+    "Guidance stops the agent giving up when no billing account is accessible");
+
 using var mgThrottledHttp = new HttpClient(new StubHandler(_ =>
 {
     var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests) { Content = new StringContent("{\"error\":{\"code\":\"429\"}}") };
@@ -508,10 +556,12 @@ using (var mg = JsonDocument.Parse(mgThrottled))
         && quota.GetProperty("x-ms-ratelimit-microsoft.costmanagement-qpu-remaining").GetString()!.Contains("QueriesPer10Sec:11"),
         "Management-group throttle keeps the quota diagnostics that identify which limit fired");
 }
-Check(mgTools["QueryCostsAcrossSubscriptions"].Description.Contains("CANNOT answer")
-    && mgTools["QueryAzure"].Description.Contains("SPIKE / TREND / REGION")
-    && mgTools["QueryAzure"].Description.Contains("ResourceLocation"),
-    "Spike, region and trend questions route away from the estate-total tool");
+Check(mgTools["QueryAzure"].Description.Contains("SPIKE / TREND QUESTIONS")
+    && mgTools["QueryAzure"].Description.Contains("no daily granularity")
+    && mgTools["QueryAzure"].Description.Contains("ResourceLocation")
+    && mgTools["QueryAzure"].Description.Contains("BREAKDOWN ACROSS MANY SUBSCRIPTIONS")
+    && mgTools["QueryCostsAcrossSubscriptions"].Description.Contains("no daily granularity"),
+    "Per-day series route to a scoped query while cross-subscription breakdowns use groupBy");
 var parseCost = typeof(AzureQueryTools).GetMethod("TryReadCost", BindingFlags.Static | BindingFlags.NonPublic)!;
 object?[] parseArguments = ["HTTP 200 OK\n" + JsonSerializer.Serialize(new { properties = new { nextLink = "https://management.azure.com/next" } }), 0d, null, null];
 Check(!(bool)parseCost.Invoke(null, parseArguments)!, "Unfinished cost page cannot become a total");
