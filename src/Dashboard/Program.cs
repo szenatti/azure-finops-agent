@@ -159,7 +159,7 @@ app.Lifetime.ApplicationStopping.Register(() =>
 
 // Scheduled background jobs — user-defined prompt + cadence, executed as agent
 // turns in per-job sessions. Auth is delegated-only via the persisted refresh
-// token (see JobScheduler docs); tool surface identical to chat (no DELETE).
+// token (see JobScheduler docs); tool surface identical to chat (read-only).
 var jobStore = new AzureFinOps.Dashboard.Jobs.JobStore(loggerFactory.CreateLogger("AzureFinOps.Jobs"));
 var jobScheduler = new AzureFinOps.Dashboard.Jobs.JobScheduler(
     jobStore,

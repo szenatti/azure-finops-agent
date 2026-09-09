@@ -7,6 +7,8 @@ description: "Azure Cost, Billing & FinOps API reference for agent tool developm
 
 All ARM APIs use `https://management.azure.com/{scope}/providers/...` with Entra ID bearer tokens unless noted.
 
+The agent itself is read-only and cannot call the `PUT`/`PATCH`/`DELETE` operations listed below — they are documented so generated remediation scripts use the correct endpoint, payload, and API version.
+
 ## 1. Cost Management (`Microsoft.CostManagement`)
 
 - **Query** — POST `.../query` — aggregated cost analysis with grouping/filtering

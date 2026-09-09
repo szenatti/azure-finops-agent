@@ -15,10 +15,11 @@ namespace AzureFinOps.Dashboard.AI.Tools;
 /// The LLM constructs the URL and optional body; this tool executes the HTTP request.
 /// All calls are traced via OpenTelemetry → Application Insights for analysis.
 ///
-/// Security model: GET, PUT, and PATCH are allowed; POST is restricted to known
-/// read-only query/report/calculation endpoints. Mutating action POSTs and DELETE
-/// are blocked at the code level. Beyond that, the user's Entra RBAC role is the security boundary —
-/// assign Reader / Cost Management Reader for read-only access.
+/// Security model: read-only. GET is allowed and POST is restricted to known
+/// read-only query/report/calculation endpoints. PUT, PATCH, DELETE and mutating
+/// action POSTs are blocked at the code level, so the agent cannot create, update or
+/// delete Azure resources. The user's Entra RBAC role remains a second boundary —
+/// assign Reader / Cost Management Reader.
 /// </summary>
 public class AzureQueryTools
 {
@@ -38,7 +39,7 @@ public class AzureQueryTools
     {
         yield return AIFunctionFactory.Create(FindSubscriptions, "FindSubscriptions", @"Finds accessible subscriptions by exact name/id, then partial name match, using cached paginated ARM discovery. Use this when a named subscription is not in the connection context. Returns only id, name, state and completeness, at most 50 matches. Duplicate names require clarification. Empty search lists a page; use nextOffset for more. Never use shell tools or GET /subscriptions to resolve names.");
         yield return AIFunctionFactory.Create(QueryAzure, "QueryAzure", @"Queries Azure ARM REST APIs (https://management.azure.com) using the signed-in user's delegated token. Returns raw JSON.
-Methods: GET, PUT, PATCH, plus allowlisted read-only POST endpoints. Mutating action POSTs and DELETE are blocked at the code level. The user's Entra RBAC is the effective access boundary.
+Methods: GET, plus allowlisted read-only POST query endpoints. This agent is READ-ONLY: PUT, PATCH, DELETE and mutating action POSTs are blocked at the code level and return HTTP 403, so never attempt a write — deliver it via GenerateScript instead. The user's Entra RBAC is a second boundary.
 
 Use standard ARM URL conventions; you know the resource providers and current api-versions. Common surfaces: Microsoft.CostManagement (query/forecast/exports), Microsoft.Consumption (budgets/pricesheets/reservation*), Microsoft.Capacity (reservations), Microsoft.BillingBenefits (savingsPlans), Microsoft.Advisor (recommendations), Microsoft.ResourceGraph (KQL across subs), Microsoft.Insights (metrics/diagnostics/autoscale), Microsoft.Compute, Microsoft.ContainerService, Microsoft.Network, Microsoft.Storage, Microsoft.Sql, Microsoft.Web, Microsoft.OperationalInsights, Microsoft.MachineLearningServices, Microsoft.CognitiveServices, Microsoft.App, Microsoft.Authorization (RBAC/Policy/Locks), Microsoft.Management, Microsoft.Quota, Microsoft.Carbon, Microsoft.Migrate, Microsoft.Support, Microsoft.ResourceHealth, Microsoft.Security.
 
@@ -75,12 +76,12 @@ Input subscriptionsJson: 'all' for all accessible subscriptions (discovered by t
     Uses Cost Management only, never budget evaluations as a live-cost substitute. It tries one supplied management-group aggregate, then at most 20 sequential subscription queries per call. Stops immediately on throttling; reports partial coverage and unattempted scopes, never a complete total for partial data. On HTTP 429 the `retry` field names the Azure quota that fired — report it verbatim. For larger estates use a supported aggregate scope or Cost Management exports. Never call this tool twice in one turn after a 429.");
 
 
-        yield return AIFunctionFactory.Create(BulkAzureRequest, "BulkAzureRequest", @"Executes MANY Azure ARM requests in ONE tool call, in parallel, server-side. Use this whenever you would otherwise loop QueryAzure for the same kind of operation across multiple resources (bulk tagging, cleanup discovery, autoshutdown rollout, budget rollout across subs, multi-resource right-sizing, RBAC fan-out, etc.).
-Input: requestsJson = JSON array of {""method"":""GET|POST|PUT|PATCH"",""path"":""/...?api-version=..."",""body"":""<optional JSON string>""}.
+        yield return AIFunctionFactory.Create(BulkAzureRequest, "BulkAzureRequest", @"Executes MANY Azure ARM READ requests in ONE tool call, in parallel, server-side. Use this whenever you would otherwise loop QueryAzure for the same kind of read across multiple resources (per-resource configuration, properties, inventory detail, quota/usage fan-out).
+Input: requestsJson = JSON array of {""method"":""GET"",""path"":""/...?api-version=...""}. POST is accepted only for the same read-only allowlist as QueryAzure.
 Optional: parallelism (default 20, max 50), stopOnFirstError (default false).
 Returns ONE compact JSON summary: {""total"":N,""succeeded"":X,""failed"":Y,""durationMs"":Z,""failures"":[{""index"":i,""status"":code,""path"":""..."",""error"":""...""}],""successSamples"":[{""path"":""..."",""name"":""...""}]}.
-DELETE is still blocked at the code level. Same per-request response trimming as QueryAzure (PUT/PATCH echoes are compacted). Throttling-aware: 429 retries are handled per request, batches stay below ARM's 1200 writes/hour/sub.
-Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Build the request list from your prior Resource Graph discovery query in the same turn.");
+READ-ONLY: PUT, PATCH, DELETE and mutating action POSTs are blocked at the code level and fail per request with HTTP 403. Throttling-aware: 429 retries are handled per request.
+Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build the request list from your prior Resource Graph discovery query in the same turn.");
     }
 
     private async Task<string> FindSubscriptions(
@@ -96,9 +97,9 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
     }
 
     private async Task<string> QueryAzure(
-        [Description("HTTP method: GET, POST, PUT, or PATCH (DELETE is blocked)")] string method,
+        [Description("HTTP method: GET, or POST for allowlisted read-only queries (PUT, PATCH and DELETE are blocked)")] string method,
         [Description("API path starting with /, e.g. /subscriptions?api-version=2022-12-01")] string path,
-        [Description("Optional JSON request body for POST/PUT/PATCH requests. Omit or leave empty for GET.")] string? body = null)
+        [Description("Optional JSON request body for read-only POST queries. Omit or leave empty for GET.")] string? body = null)
     {
         using var activity = HttpHelper.Telemetry.StartActivity("QueryAzure");
         activity?.SetTag("azure.method", method);
@@ -131,7 +132,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
             return scopeError;
         }
 
-        var (httpMethod, methodError) = HttpHelper.ResolveMethod(method, activity, "azure");
+        var (httpMethod, methodError) = HttpHelper.ResolveMethod(method, activity, "azure", allowReadOnlyPost: true);
         if (methodError is not null) return methodError;
         if (httpMethod == HttpMethod.Get && path.Split('?')[0].TrimEnd('/').Equals("/subscriptions", StringComparison.OrdinalIgnoreCase))
             return await FindSubscriptions();
@@ -792,7 +793,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
     }
 
     private async Task<string> BulkAzureRequest(
-        [Description("JSON array of {method,path,body?} objects, e.g. [{\"method\":\"PATCH\",\"path\":\"/subscriptions/.../tags/default?api-version=2021-04-01\",\"body\":\"{...}\"}]")] string requestsJson,
+        [Description("JSON array of {method,path} objects, e.g. [{\"method\":\"GET\",\"path\":\"/subscriptions/.../providers/Microsoft.Compute/virtualMachines/vm1?api-version=2024-07-01\"}]")] string requestsJson,
         [Description("Max parallel requests in flight. Default 20, max 50.")] int parallelism = 20,
         [Description("Stop the whole bulk run on the first failure. Default false (continue and report all failures).")] bool stopOnFirstError = false)
     {
@@ -832,7 +833,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar requests. Buil
             async (i, ct) =>
             {
                 var item = items[i];
-                var (httpMethod, methodError) = HttpHelper.ResolveMethod(item.Method, activity, "bulk");
+                var (httpMethod, methodError) = HttpHelper.ResolveMethod(item.Method, activity, "bulk", allowReadOnlyPost: true);
                 if (methodError is not null)
                 {
                     results[i] = new BulkResult(i, 0, item.Path ?? "", methodError, false);

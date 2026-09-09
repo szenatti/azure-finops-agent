@@ -37,15 +37,16 @@ The SDK and bundled Copilot CLI are one compatibility unit. Let the installed `G
 
 ## Security invariants
 
-The agent can read and apply approved non-destructive changes, but it never deletes Azure resources.
+The agent is read-only. It analyses and drafts changes, but it cannot create, update or delete anything in Azure or Entra.
 
-- `DELETE` is blocked centrally for Azure and Graph pass-through tools.
-- Azure `POST` is restricted to the read-only allowlist in `AzureQueryTools`; action endpoints such as start, restart, deallocate, power-off, and reservation return are blocked.
-- `PUT` and `PATCH` remain available under the signed-in user's Azure RBAC.
-- Destructive recommendations must use `GenerateScript` so the user reviews and runs them.
+- `DELETE`, `PUT` and `PATCH` are blocked centrally in `HttpHelper.ResolveMethod` for every pass-through tool (`QueryAzure`, `BulkAzureRequest`, `QueryGraph`).
+- `POST` is refused by default and re-enabled only by callers that pass `allowReadOnlyPost` and then validate the path against the read-only allowlist in `AzureQueryTools`; action endpoints such as start, restart, deallocate, power-off, and reservation return are blocked.
+- Writes are refused before any HTTP request is issued, so a Contributor/Owner user's delegated token cannot be used to change the estate. The signed-in user's RBAC is a second boundary, not the only one.
+- Remediations must be delivered through `GenerateScript` so the user reviews and runs them.
+- The Copilot CLI shell built-ins (`bash`, `powershell`, `rg`) remain enabled for in-container data processing; they are not covered by the HTTP guard, so treat container egress and the app's own managed identity as the residual write channel.
 - Every session, job, upload, generated artifact, and transcript endpoint must enforce per-user ownership.
 - Ownership of a session is established by comparing its recorded working directory to the caller's own. A filter passed to an SDK list call is a query hint, never the boundary: verify what comes back, drop entries with no recorded directory, and never adopt or resume a session that has not passed that check.
-- Standard add-on consent tiers are read-only. Graph writes require separately granted write scopes.
+- Standard add-on consent tiers are read-only, and Graph writes are blocked in code regardless of consented scopes.
 - Never log or return bearer tokens, refresh tokens, secrets, authorization headers, or connection strings.
 
 ### Untrusted-input rules

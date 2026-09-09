@@ -6,18 +6,19 @@ Perform a complete security audit of this agent to verify it is strictly read-on
 
 ### 1. HTTP Method Enforcement
 
-Scan `AzureQueryTools.cs` and confirm:
+Scan `HttpHelper.ResolveMethod` — the single choke point every pass-through tool uses — and confirm:
 
-- Only `GET` and `POST` are accepted — `PUT`, `PATCH`, `DELETE` must be rejected (HTTP 400).
-- POST requests are validated against the `SafePostSuffixes` allowlist.
-- List every suffix in the allowlist and verify each is a read-only query/report endpoint.
-- Search for any code path that could bypass the allowlist (e.g. direct `HttpClient` usage outside `HttpHelper`).
+- `PUT`, `PATCH` and `DELETE` are rejected (HTTP 403) before any request is sent.
+- `POST` is rejected by default and accepted only when the caller passes `allowReadOnlyPost`.
+- Only `AzureQueryTools` opts in, and it then validates the path with `ValidateReadOnlyPostPath`.
+- List every pattern in that allowlist and verify each is a read-only query/report endpoint.
+- Search for any code path that could bypass the choke point (e.g. direct `HttpClient` usage, or a tool calling `HttpHelper.SendCoreAsync`/`SendWithRetryAsync` with a host-built write method).
 
 ### 2. Graph and Log Analytics Tools
 
 Scan `GraphQueryTools.cs` and confirm:
 
-- Only `GET` requests are made — no method parameter exposed to the LLM.
+- A `method` parameter is exposed to the LLM, but anything other than `GET` is refused by `ResolveMethod` because the tool does not opt into read-only POST.
 - The URL is hardcoded to `https://graph.microsoft.com`.
 
 Scan `LogAnalyticsQueryTools.cs` and confirm:
@@ -51,10 +52,18 @@ Scan all remaining tool files (`ChartTools.cs`, `HealthTools.cs`, `FaqTools.cs`,
 
 Scan `HttpHelper.cs` and confirm:
 
-- It does not impose or bypass any method restrictions — it's a transport layer.
-- Each tool controls what HTTP method is passed to it.
+- `ResolveMethod` is the central method policy, and every pass-through tool routes model-supplied methods through it.
+- The transport helpers themselves accept a host-supplied `HttpMethod`, so verify no tool hands them a write method derived from model input.
 
-### 7. Token Context
+### 7. Residual write channels
+
+The HTTP guard does not cover the Copilot CLI shell built-ins (`bash`, `powershell`, `rg`), which remain enabled. Confirm:
+
+- `ExcludedBuiltInTools` in `CopilotSessionFactory.cs` and whether the shells are excluded in this deployment.
+- The container's own managed-identity role assignments (`infra/modules/roles.bicep`) — image pull and model inference only.
+- That the account used to connect holds only Reader / Cost Management Reader if a tenant-side guarantee is required.
+
+### 8. Token Context
 
 Scan `TokenContext.cs` and confirm:
 

@@ -529,31 +529,37 @@ public static class HttpHelper
 
     /// <summary>
     /// Centralised method-policy for all pass-through HTTP tools (Azure ARM, Microsoft Graph, etc.).
-    /// Allows GET/POST/PUT/PATCH. Blocks DELETE at the code level — the user's RBAC role is the
-    /// effective access boundary for everything else.
+    /// The agent is read-only: only GET is allowed, plus POST for callers that opt in via
+    /// <paramref name="allowReadOnlyPost"/> and then validate the path against their own read-only
+    /// allowlist. Create/update/delete methods are refused here so the user's RBAC is a second
+    /// boundary rather than the only one.
     /// Returns the parsed <see cref="HttpMethod"/>, or a ready-to-return error string when the
     /// method is rejected. Callers do: <c>var (m, err) = HttpHelper.ResolveMethod(...); if (err != null) return err;</c>
     /// </summary>
     public static (HttpMethod? Method, string? ErrorResponse) ResolveMethod(
         string? method,
         Activity? activity,
-        string telemetryPrefix)
+        string telemetryPrefix,
+        bool allowReadOnlyPost = false)
     {
         var normalized = (method ?? "GET").Trim().ToUpperInvariant();
 
-        if (normalized == "DELETE")
+        if (normalized is "DELETE" or "PUT" or "PATCH" or "POST")
         {
-            activity?.SetTag($"{telemetryPrefix}.result", "blocked_delete");
-            activity?.SetStatus(ActivityStatusCode.Error, "DELETE blocked");
-            return (null, "HTTP 403 Forbidden\nThis agent does not perform DELETE operations. Generate a script via GenerateScript for the user to review and run themselves.");
+            // POST is the only write verb a caller can re-enable, and only for an
+            // allowlist of query/report endpoints it validates itself.
+            if (normalized != "POST" || !allowReadOnlyPost)
+            {
+                activity?.SetTag($"{telemetryPrefix}.result", $"blocked_{normalized.ToLowerInvariant()}");
+                activity?.SetStatus(ActivityStatusCode.Error, $"{normalized} blocked");
+                return (null, $"HTTP 403 Forbidden\nThis agent is read-only — {normalized} is blocked at the code level, so nothing can be created, updated or deleted. Call GenerateScript so the user can review and run the change themselves.");
+            }
         }
 
         var resolved = normalized switch
         {
             "GET" => HttpMethod.Get,
             "POST" => HttpMethod.Post,
-            "PUT" => HttpMethod.Put,
-            "PATCH" => HttpMethod.Patch,
             _ => null
         };
 
@@ -561,7 +567,8 @@ public static class HttpHelper
         {
             activity?.SetTag($"{telemetryPrefix}.result", "invalid_method");
             activity?.SetStatus(ActivityStatusCode.Error, "Invalid method");
-            return (null, $"HTTP 400 BadRequest\nInvalid method: '{method}'. Allowed: GET, POST, PUT, PATCH.");
+            var allowed = allowReadOnlyPost ? "GET, POST (read-only allowlist)" : "GET";
+            return (null, $"HTTP 400 BadRequest\nInvalid method: '{method}'. Allowed: {allowed}.");
         }
 
         return (resolved, null);

@@ -214,7 +214,7 @@ public sealed class CrawlMaturityTools
             .Select(name => Truncate(name, 100))
             .ToArray();
         var firstActionPrompt = complete
-            ? $"Review existing valid CostCenter, Owner, and Environment values, then propose missing tags, daily exports and anomaly alerts across {subscriptions.Count} subscriptions. Ask before any write, never invent tag values, and do not delete resources."
+            ? $"Review existing valid CostCenter, Owner, and Environment values, then generate one script that adds the missing tags, daily exports and anomaly alerts across {subscriptions.Count} subscriptions. Never invent tag values, and do not delete resources."
             : "Review the incomplete Crawl evidence categories and help me select a smaller subscription scope for a complete read-only assessment. Do not make changes.";
         var followUpActions = new[]
         {

@@ -26,7 +26,7 @@ namespace AzureFinOps.Dashboard.Jobs;
 /// chat turn in the same session; preserves the user's CurrentSessionId
 /// (session acquisition repoints it as a side effect — without restore, a 3 AM
 /// run would hijack which conversation the user sees next morning); tool
-/// surface is identical to chat (GET/POST/PUT/PATCH, DELETE blocked).
+/// surface is identical to chat (read-only: GET plus allowlisted POST queries).
 /// </summary>
 public sealed class JobScheduler : BackgroundService
 {

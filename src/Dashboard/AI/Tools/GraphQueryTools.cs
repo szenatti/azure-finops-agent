@@ -20,7 +20,7 @@ public class GraphQueryTools
     public IEnumerable<AIFunction> Create()
     {
         yield return AIFunctionFactory.Create(QueryGraph, "QueryGraph", @"Calls Microsoft Graph API (https://graph.microsoft.com) using the signed-in user's token. Returns raw JSON.
-Methods: GET, POST, PUT, PATCH. DELETE is blocked at the code level. NOTE: the standard consent tiers only grant read-only scopes (*.Read.All / Reports.Read.All), so write calls return 403 insufficient privileges unless the tenant has consented to write scopes — surface that to the user rather than retrying.
+Method: GET only. This agent is READ-ONLY — POST, PUT, PATCH and DELETE are blocked at the code level and return HTTP 403, so directory objects, groups and licence assignments can never be created, changed or removed. Surface that to the user instead of retrying.
 DATA SCOPING: ALWAYS use $select to pick only needed fields, $top to limit rows, $filter to scope. Never fetch full user objects. Paginate via @odata.nextLink for large tenants.
 
 Use standard Graph URL conventions; you know the v1.0 surface. FinOps-relevant areas:
@@ -36,8 +36,8 @@ Use standard Graph URL conventions; you know the v1.0 surface. FinOps-relevant a
 
     private async Task<string> QueryGraph(
         [Description("API path starting with /, e.g. /v1.0/subscribedSkus")] string path,
-        [Description("HTTP method: GET, POST, PUT, or PATCH (DELETE is blocked)")] string? method = "GET",
-        [Description("Optional JSON request body for POST/PUT/PATCH requests. Omit for GET.")] string? body = null)
+        [Description("HTTP method: GET only (POST, PUT, PATCH and DELETE are blocked)")] string? method = "GET",
+        [Description("Unused — read-only tool. Leave empty.")] string? body = null)
     {
         using var activity = HttpHelper.Telemetry.StartActivity("QueryGraph");
         activity?.SetTag("graph.method", method);

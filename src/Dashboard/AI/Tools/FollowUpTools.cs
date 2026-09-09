@@ -23,7 +23,7 @@ Rules:
   label  = ""Rank top 5 actions by $ impact""
   prompt = ""Across all the data we just analyzed, deeply re-examine it and produce a ranked list of the 5 most impactful, actionable FinOps actions I should take. For each: (a) the concrete action in one sentence, (b) which file/resource/RG it applies to, (c) estimated $ saving (or risk if it's a governance action), (d) effort (low/med/high). Keep it short and decision-ready — a CFO should be able to read it in 30 seconds.""
 
-For label2/label3 prefer (in order): GenerateScript on the #1 issue → GenerateHtmlPresentation → drill into top cost driver/RG/SKU → bulk PATCH tagging when Azure connected and tagging is the top finding.
+For label2/label3 prefer (in order): GenerateScript on the #1 issue → GenerateHtmlPresentation → drill into top cost driver/RG/SKU → a tagging remediation script when Azure connected and tagging is the top finding.
 
 ## Small / single-question answers: just label/prompt.
 

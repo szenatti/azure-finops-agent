@@ -983,10 +983,10 @@
                     </div>
                   </div>
                   <div class="hero-card">
-                    <div class="hero-card-title">Agentic remediation</div>
+                    <div class="hero-card-title">Agentic analysis</div>
                     <div class="hero-card-desc">
-                      Applies tags. Sets budgets. Drafts cleanup scripts. Never
-                      deletes.
+                      Finds the waste. Drafts the tagging, budget and cleanup
+                      scripts. Read-only — never changes your estate.
                     </div>
                   </div>
                   <div class="hero-card">
@@ -2396,9 +2396,9 @@
               </div>
               <div class="job-modal-subtitle">
                 Runs in the background — even with the browser closed — using
-                only your delegated Azure permissions: the agent can never do
-                more than your own login allows. Every run's output lands in the
-                job's conversation.
+                only your delegated Azure permissions, and read-only: the agent
+                reports and drafts scripts, it never changes your estate. Every
+                run's output lands in the job's conversation.
               </div>
             </div>
             <button
@@ -3680,11 +3680,11 @@ const JOB_TEMPLATES = [
   },
   {
     emoji: "🎯",
-    label: "Reserve X when available",
-    name: "Reserve Standard_NC40ads_H100_v5 when available",
+    label: "Alert me when X is available",
+    name: "Watch capacity for Standard_NC40ads_H100_v5",
     interval: 15,
     prompt:
-      "Check quota and on-demand capacity for Standard_NC40ads_H100_v5 (replace with the VM size you want) across all my subscriptions and regions. IDEMPOTENCY FIRST: if a capacity reservation group named 'finops-capacity-crg' already exists in any region, do nothing and report what is already reserved. Otherwise, if the size is deployable AND I have quota headroom for it: secure it immediately by creating resource group 'finops-capacity' (if missing), capacity reservation group 'finops-capacity-crg', and an on-demand capacity reservation 'finops-reserve-1' with that size and capacity 1 in that region (ARM PUT). Then state exactly what was reserved, that it bills at the full VM rate while held, and that I should pause this job and delete the reservation (you'll generate the cleanup script) when done. If my RBAC blocks the write, say so. If nothing is deployable, list the closest regions with quota headroom.",
+      "Check quota and on-demand capacity for Standard_NC40ads_H100_v5 (replace with the VM size you want) across all my subscriptions and regions. If it is deployable somewhere AND I have quota headroom, say so up front: name the region and subscription, and generate a ready-to-run script that creates resource group 'finops-capacity', a capacity reservation group, and an on-demand capacity reservation for that size with capacity 1 in that region. Note that a held reservation bills at the full VM rate. If nothing is deployable, list the closest regions with quota headroom. You are read-only, so never attempt to create the reservation yourself.",
   },
   {
     emoji: "⚡",

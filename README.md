@@ -7,7 +7,7 @@
 
 **Turn Azure cost, governance, and optimization work into a conversation.**
 
-Azure FinOps Agent analyzes live Azure data, scores FinOps maturity, finds savings, creates charts and executive decks, and generates reviewable remediation scripts. It can read and apply approved non-destructive changes with the signed-in user's delegated permissions; it never deletes Azure resources.
+Azure FinOps Agent analyzes live Azure data, scores FinOps maturity, finds savings, creates charts and executive decks, and generates reviewable remediation scripts. It is read-only: it reads with the signed-in user's delegated permissions and cannot create, update, or delete Azure resources — changes are delivered as scripts you review and run.
 
 [Try the hosted demo](https://azure-finops-agent.com) · [View the presentation](https://azure-finops-agent.com/slides)
 
@@ -112,8 +112,8 @@ Open [http://localhost:5000](http://localhost:5000).
 ## Security
 
 - OAuth uses PKCE, nonce validation, incremental delegated consent, and explicit resource scopes.
-- The user's Azure RBAC and consented scopes remain the effective authorization boundary.
-- Azure `DELETE` and mutating action `POST` operations are blocked in code.
+- Azure and Microsoft Graph writes — `PUT`, `PATCH`, `DELETE`, and mutating action `POST` — are refused in code before any request is sent. `POST` is limited to an allowlist of read-only query and report endpoints.
+- The user's Azure RBAC and consented scopes are a second boundary, not the only one. For a hard guarantee that is independent of this application, connect an account holding only Reader / Cost Management Reader.
 - Generated downloads and session transcripts are ownership-checked.
 - Production secrets belong in managed identities, App Service settings, or GitHub Actions secrets—not in source control.
 

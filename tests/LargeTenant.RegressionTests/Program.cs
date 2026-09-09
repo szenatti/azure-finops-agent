@@ -380,6 +380,38 @@ var tools = new AzureQueryTools(new UserTokens { AzureToken = toolToken }).Creat
 Check(tools["QueryAzure"].Description.Contains("api-version=" + AzureApiVersions.CostQuery)
     && tools["QueryAzure"].Description.Contains("alerts=" + AzureApiVersions.CostAlerts)
     && !tools["QueryAzure"].Description.Contains("2026-08-01"), "B14: Tool guidance uses centralized endpoint-specific API versions");
+
+// Read-only boundary: writes must be refused before any HTTP request leaves the host,
+// so a Contributor/Owner user's delegated token cannot be used to change the estate.
+foreach (var refusedMethod in new[] { "PUT", "PATCH", "DELETE" })
+{
+    var refused = await Invoke(tools["QueryAzure"], new AIFunctionArguments
+    {
+        ["method"] = refusedMethod,
+        ["path"] = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg/providers/Microsoft.Resources/tags/default?api-version=2021-04-01",
+        ["body"] = "{}"
+    });
+    Check(refused.StartsWith("HTTP 403") && refused.Contains("read-only"), $"Read-only: QueryAzure {refusedMethod} is blocked");
+}
+var actionPost = await Invoke(tools["QueryAzure"], new AIFunctionArguments
+{
+    ["method"] = "POST",
+    ["path"] = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1/restart?api-version=2024-07-01"
+});
+Check(actionPost.StartsWith("HTTP 403"), "Read-only: mutating action POST is blocked");
+var bulkWrite = await Invoke(tools["BulkAzureRequest"], new AIFunctionArguments
+{
+    ["requestsJson"] = "[{\"method\":\"PATCH\",\"path\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg/providers/Microsoft.Resources/tags/default?api-version=2021-04-01\",\"body\":\"{}\"}]"
+});
+using (var bulk = JsonDocument.Parse(bulkWrite[(bulkWrite.IndexOf('{') is var bi && bi >= 0 ? bi : 0)..]))
+    Check(bulk.RootElement.GetProperty("succeeded").GetInt32() == 0
+        && bulk.RootElement.GetProperty("failed").GetInt32() == 1, "Read-only: BulkAzureRequest cannot fan out writes");
+var graphTools = new GraphQueryTools(new UserTokens { GraphToken = toolToken }).Create().ToDictionary(tool => tool.Name);
+var graphWrite = await Invoke(graphTools["QueryGraph"], new AIFunctionArguments
+{
+    ["path"] = "/v1.0/groups", ["method"] = "POST", ["body"] = "{}"
+});
+Check(graphWrite.StartsWith("HTTP 403") && graphWrite.Contains("read-only"), "Read-only: QueryGraph write is blocked");
 var lookup = await Invoke(tools["FindSubscriptions"], new AIFunctionArguments { ["search"] = "target-infrastructure" });
 using (var match = JsonDocument.Parse(lookup))
     Check(match.RootElement.GetProperty("matchCount").GetInt32() == 1 && toolDiscoveryCalls == 1,
