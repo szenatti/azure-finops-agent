@@ -550,6 +550,24 @@ EXAMPLE:
     // Shell template (with nav chrome)
     // ────────────────────────────────────────────────────────────────────
 
+    private static readonly Lazy<string> ChartJsSource = new(() =>
+    {
+        var assembly = typeof(HtmlPresentationTools).Assembly;
+        var resource = assembly.GetManifestResourceNames()
+            .FirstOrDefault(name => name.EndsWith("chart.umd.min.js", StringComparison.Ordinal));
+        if (resource is null) return "";
+        using var stream = assembly.GetManifestResourceStream(resource)!;
+        using var reader = new StreamReader(stream);
+        // A literal closing tag inside the library would end the <script> element early.
+        return reader.ReadToEnd().Replace("</script", @"<\/script", StringComparison.Ordinal);
+    });
+
+    // Inlined so a downloaded deck renders offline and behind strict proxies.
+    // Falls back to the CDN only if the embedded resource is ever missing.
+    private static string ChartRuntimeTag => ChartJsSource.Value is { Length: > 0 } source
+        ? $"<script>{source}</script>"
+        : @"<script src=""https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js""></script>";
+
     private static string BuildShell(string title, string slidesHtml, string chartScripts) => $@"<!doctype html>
 <html lang=""en"">
 <head>
@@ -557,7 +575,7 @@ EXAMPLE:
 <meta name=""viewport"" content=""width=device-width,initial-scale=1"">
 <title>{Esc(title)}</title>
 <link href=""https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap"" rel=""stylesheet"">
-<script src=""https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js""></script>
+{ChartRuntimeTag}
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 :root{{

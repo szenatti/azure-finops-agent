@@ -776,9 +776,15 @@ Check(deckHtml.Contains("\"#e74c3c\",\"#7f8c8d\",\"#f39c12\"", StringComparison.
 Check(deckHtml.Contains("title-bullets", StringComparison.Ordinal)
     && deckHtml.Contains("Cleanup is scriptable", StringComparison.Ordinal),
     "Title-slide bullets are rendered rather than silently dropped");
-Check(!deckHtml.Contains("tension:", StringComparison.Ordinal)
+// Scope to the generated chart config; the inlined library uses `tension` itself.
+var deckChartConfig = deckHtml[deckHtml.IndexOf("document.getElementById('chart_", StringComparison.Ordinal)..];
+Check(!deckChartConfig.Contains("tension:", StringComparison.Ordinal)
     && !deckHtml.Contains("s-title-bg", StringComparison.Ordinal),
     "Bar charts omit line-only options and the dead title-background element is gone");
+Check(!deckHtml.Contains("cdn.jsdelivr.net", StringComparison.Ordinal)
+    && deckHtml.Contains("Chart.js v4.4.0", StringComparison.Ordinal)
+    && deckHtml.Contains("Released under the MIT License", StringComparison.Ordinal),
+    "Chart.js is inlined with its licence banner, so a downloaded deck renders offline");
 
 Console.WriteLine("All large-tenant regression checks passed.");
 

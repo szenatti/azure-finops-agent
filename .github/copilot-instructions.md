@@ -150,6 +150,8 @@ Use `GetCrawlMaturityEvidence` exactly once for explicit Crawl scoring.
 - Generated script/deck markers are converted into structured SSE events.
 - Download endpoints require an authenticated session and owner match.
 - Expired artifacts render an expired state rather than a dead link.
+- Chart.js 4.4.0 is vendored at `src/Dashboard/AI/Tools/Assets/chart.umd.min.js` (MIT, banner retained) and embedded in the assembly, so a downloaded deck renders offline. Keep it inlined, keep the licence banner, and update the pinned version in one place. Google Fonts stays remote and degrades to a system font.
+- Every deck layout must wrap its body in `.content`. `.slide` is a flex row, so an unwrapped layout renders its children side by side. Use `data-idx`, not `data-i`.
 
 ## Scheduled jobs
 

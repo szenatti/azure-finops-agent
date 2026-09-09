@@ -29,6 +29,8 @@
   <!-- Embed Python script templates as resources (loaded at runtime by tools) -->
   <ItemGroup>
     <EmbeddedResource Include="AI\Tools\Resources\*.py" />
+    <!-- Vendored so generated decks render offline; MIT, banner retained in the file. -->
+    <EmbeddedResource Include="AI\Tools\Assets\chart.umd.min.js" />
     <InternalsVisibleTo Include="LargeTenant.RegressionTests" />
   </ItemGroup>
 
