@@ -443,6 +443,46 @@ using (var summary = JsonDocument.Parse(total))
 Check(typeof(AzureQueryTools).GetMethod("TryReadCurrentMonthSpendFromBudgets", BindingFlags.NonPublic | BindingFlags.Instance) is null,
     "Live cost totals no longer use the budget fan-out shortcut");
 
+// Coverage: an estate-wide answer must never be assembled from a management-group rollup,
+// which drops subscriptions Cost Management cannot aggregate instead of failing.
+const string mgCostPath = "/providers/Microsoft.Management/managementGroups/root/providers/Microsoft.CostManagement/query?api-version=2026-06-01";
+var mgCaveat = AzureQueryTools.AppendManagementGroupCoverageCaveat(mgCostPath, "HTTP 200 OK\n{\"properties\":{\"rows\":[]}}");
+Check(mgCaveat.StartsWith("HTTP 200 OK\n{") && mgCaveat.Contains("COVERAGE WARNING")
+    && mgCaveat.Contains("NOT an all-subscription total"),
+    "Management-group cost rollups carry a coverage warning without breaking the HTTP-plus-JSON contract");
+Check(!AzureQueryTools.AppendManagementGroupCoverageCaveat(
+        "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.CostManagement/query?api-version=2026-06-01",
+        "HTTP 200 OK\n{}").Contains("COVERAGE WARNING")
+    && !AzureQueryTools.AppendManagementGroupCoverageCaveat(mgCostPath, "HTTP 400 BadRequest\nno").Contains("COVERAGE WARNING"),
+    "Coverage warning is scoped to successful management-group cost responses");
+Check(tools["QueryAzure"].Description.Contains("NEVER use a management group")
+    && tools["QueryAzure"].Description.Contains("stand-in for 'all subscriptions'"),
+    "Tool guidance forbids substituting a management group for an estate-wide total");
+
+// The interactive limit is a wall-clock budget, not a fixed 20 scopes: cached scopes replay
+// without touching the tenant gate, so repeating the call resumes instead of restarting.
+Check(!tools["QueryCostsAcrossSubscriptions"].Description.Contains("at most 20 sequential")
+    && tools["QueryCostsAcrossSubscriptions"].Description.Contains("RESUMES"),
+    "Cross-subscription guidance advertises resumable coverage rather than a 20-query ceiling");
+var restoreBudget = AzureQueryTools.InteractiveCostScopeBudget;
+AzureQueryTools.InteractiveCostScopeBudget = TimeSpan.Zero;
+try
+{
+    var exhausted = await Invoke(tools["QueryCostsAcrossSubscriptions"], new AIFunctionArguments
+    {
+        ["subscriptionsJson"] = "all", ["from"] = new DateOnly(today.Year, today.Month, 1).ToString("yyyy-MM-dd"),
+        ["to"] = today.AddDays(1).ToString("yyyy-MM-dd")
+    });
+    using var budgeted = JsonDocument.Parse(exhausted);
+    Check(budgeted.RootElement.GetProperty("unattempted").GetInt32() == 230
+        && !budgeted.RootElement.GetProperty("complete").GetBoolean()
+        && budgeted.RootElement.GetProperty("totalCost").ValueKind == JsonValueKind.Null,
+        "Exhausted scope budget attempts nothing and never reports a complete total");
+    Check(budgeted.RootElement.GetProperty("results")[0].GetProperty("error").GetString()!.Contains("resume from cache"),
+        "Budget-limited scopes tell the caller how to resume coverage");
+}
+finally { AzureQueryTools.InteractiveCostScopeBudget = restoreBudget; }
+
 using var mgThrottledHttp = new HttpClient(new StubHandler(_ =>
 {
     var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests) { Content = new StringContent("{\"error\":{\"code\":\"429\"}}") };

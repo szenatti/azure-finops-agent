@@ -24,6 +24,11 @@ namespace AzureFinOps.Dashboard.AI.Tools;
 public class AzureQueryTools
 {
     internal const string NoCostRows = "No matching cost rows were returned; spend is unknown, not zero.";
+
+    // Cached scopes replay without touching the tenant gate, so a wall-clock budget lets a
+    // repeated call resume where the previous one stopped instead of re-querying the same head.
+    internal static TimeSpan InteractiveCostScopeBudget = TimeSpan.FromSeconds(90);
+
     private readonly UserTokens _tokens;
     private readonly HttpClient? _http;
 
@@ -53,7 +58,7 @@ Never bare /providers/Microsoft.CostManagement/... — that returns 400.
 
 COST MANAGEMENT QUERY: use api-version=" + AzureApiVersions.CostQuery + @". ALWAYS group by a real dimension (ServiceName, ResourceGroupName, MeterCategory). Do NOT add 'UsageDate' to the grouping array — it's a response column, not a dimension; use granularity=""Daily"" for per-day. Never request raw ungrouped cost data. For a plain total across all subscriptions, use QueryCostsAcrossSubscriptions with subscriptionsJson='all'; never fan out one query per subscription. Budget currentSpend is last evaluated spend, NOT live cost and NOT a service breakdown. GET /subscriptions returns a compact page; use FindSubscriptions for name resolution.
 SPIKE / TREND / REGION / SERVICE QUESTIONS: do NOT use QueryCostsAcrossSubscriptions — it returns one undifferentiated total per subscription. Issue ONE query here at the narrowest scope that covers the question, with granularity=""Daily"" for a per-day series and dataset.filter for dimensions. Region example: {""dimensions"":{""name"":""ResourceLocation"",""operator"":""In"",""values"":[""East US"",""West US 2""]}}. Grouping accepts at most 2 dimensions. ResourceLocation values are Cost Management's own labels; if a region filter returns no rows, re-run grouped by ResourceLocation to read the actual values instead of guessing, and report zero rows as unknown, never as zero spend.
-MANAGEMENT-GROUP SCOPE: unsupported for Microsoft Customer Agreement and CSP accounts. Even on an Enterprise Agreement it can return 'Management group ... does not have any valid subscriptions' when the group holds no subscriptions Cost Management can aggregate for this caller. That is a deterministic HTTP 400, never a throttle: do not retry it, fall back to subscription scope and say the aggregate was unavailable. Management-group totals cover usage charges only and EXCLUDE reservations, savings plans and Marketplace purchases, so they are not comparable with billing-account totals; state that exclusion whenever you report one.
+MANAGEMENT-GROUP SCOPE: NEVER use a management group — including the tenant root group — as a stand-in for 'all subscriptions'. A rollup silently OMITS every subscription Cost Management cannot aggregate for this caller (documented behaviour for CSP subscriptions) and returns HTTP 200 for the remainder, so a small total is indistinguishable from a complete one. Answer estate-wide questions with QueryCostsAcrossSubscriptions using subscriptionsJson='all', or a billing-account scope. Management-group scope is unsupported for Microsoft Customer Agreement and CSP accounts, and even on an Enterprise Agreement it can return 'Management group ... does not have any valid subscriptions' when the group holds no subscriptions Cost Management can aggregate for this caller. That is a deterministic HTTP 400, never a throttle: do not retry it, fall back to subscription scope and say the aggregate was unavailable. Management-group totals cover usage charges only and EXCLUDE reservations, savings plans and Marketplace purchases, so they are not comparable with billing-account totals; state the scope and both exclusions whenever you report one.
 OTHER COST API VERSIONS: forecast=" + AzureApiVersions.CostForecast + "; exports=" + AzureApiVersions.CostExports + "; alerts=" + AzureApiVersions.CostAlerts + "; scheduledActions=" + AzureApiVersions.ScheduledActions + "; Consumption budgets=" + AzureApiVersions.Budgets + @". Each endpoint has its own supported version; do not invent a newer one. Preserve versions explicitly requested for controlled comparisons.
 
 THROTTLING: Cost Management /query and /forecast are aggressively throttled per-tenant. Interactive queries make at most one short retry; other transient calls retain the standard retry policy. Do NOT call multiple CostManagement endpoints in parallel from the same turn — Resource Graph and Advisor parallelize fine. If a call still returns HTTP 429, do not make another Cost Management call in the same turn; report the throttle and offer to retry later.
@@ -73,7 +78,7 @@ For public retail pricing use https://prices.azure.com (no auth) with ?$filter=a
         yield return AIFunctionFactory.Create(QueryCostsAcrossSubscriptions, "QueryCostsAcrossSubscriptions", @"Gets a PLAIN COST TOTAL per subscription, plus coverage counts and up to 50 subscription details, in ONE agent tool call. Use this only when the question is 'how much did we spend' across many subscriptions; never loop QueryAzure yourself. Cached results may be up to five minutes old and Azure cost ingestion may lag usage.
 LIMITS — this tool queries with granularity 'None' and NO dimension filter, so it returns a single number per subscription for the whole window. It CANNOT answer questions about daily series, spikes, trends, regions, services, meters or resource groups. For any of those, issue ONE scoped QueryAzure Cost Management query with granularity='Daily' and/or dataset.filter instead of calling this tool.
 Input subscriptionsJson: 'all' for all accessible subscriptions (discovered by the host, never copy a truncated context list), or an explicit JSON array of selected {id,name} scopes. Input managementGroupId: an optional verified containing management group. Dates are yyyy-MM-dd; `to` is the exclusive end date.
-    Uses Cost Management only, never budget evaluations as a live-cost substitute. It tries one supplied management-group aggregate, then at most 20 sequential subscription queries per call. Stops immediately on throttling; reports partial coverage and unattempted scopes, never a complete total for partial data. On HTTP 429 the `retry` field names the Azure quota that fired — report it verbatim. For larger estates use a supported aggregate scope or Cost Management exports. Never call this tool twice in one turn after a 429.");
+    Uses Cost Management only, never budget evaluations as a live-cost substitute. It tries one supplied management-group aggregate, then queries subscriptions sequentially until a wall-clock budget is reached. Already-queried subscriptions are cached for five minutes and replay instantly, so on a large estate calling this tool again within that window RESUMES from where it stopped — repeat until `unattempted` reaches 0, reporting coverage each time. Stops immediately on throttling; reports partial coverage and unattempted scopes, never a complete total for partial data. On HTTP 429 the `retry` field names the Azure quota that fired — report it verbatim. Never call this tool twice in one turn after a 429.");
 
 
         yield return AIFunctionFactory.Create(BulkAzureRequest, "BulkAzureRequest", @"Executes MANY Azure ARM READ requests in ONE tool call, in parallel, server-side. Use this whenever you would otherwise loop QueryAzure for the same kind of read across multiple resources (per-resource configuration, properties, inventory detail, quota/usage fan-out).
@@ -143,12 +148,32 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
         }
 
         var hasBody = !string.IsNullOrWhiteSpace(body);
-        return await HttpHelper.SendWithRetryAsync(
+        var response = await HttpHelper.SendWithRetryAsync(
             $"https://management.azure.com{path}",
             token, activity, "azure",
             method: httpMethod,
             jsonBody: hasBody && httpMethod != HttpMethod.Get ? body : null,
             includeTimestamp: true);
+        return AppendManagementGroupCoverageCaveat(path, response);
+    }
+
+    /// <summary>
+    /// A successful management-group rollup is not evidence of estate-wide coverage: Cost Management
+    /// drops subscriptions it cannot aggregate for the caller instead of failing, so the model needs
+    /// the caveat attached to the data rather than inferred from the scope.
+    /// </summary>
+    internal static string AppendManagementGroupCoverageCaveat(string path, string response)
+    {
+        if (!response.StartsWith("HTTP 200", StringComparison.Ordinal)) return response;
+        var pathOnly = path.Split('?')[0];
+        if (!pathOnly.Contains("/providers/Microsoft.Management/managementGroups/", StringComparison.OrdinalIgnoreCase)
+            || !pathOnly.Contains("/providers/Microsoft.CostManagement/", StringComparison.OrdinalIgnoreCase))
+            return response;
+        return response + "\n\nCOVERAGE WARNING: management-group scope. This rollup silently excludes every "
+            + "subscription Cost Management cannot aggregate for this caller, and always excludes reservations, "
+            + "savings plans and Marketplace purchases. It is NOT an all-subscription total and must never be "
+            + "labelled one. For estate-wide spend use QueryCostsAcrossSubscriptions with subscriptionsJson='all', "
+            + "or a billing-account scope. If you report this number, state the scope and both exclusions.";
     }
 
     private async Task<string> QueryCostsAcrossSubscriptions(
@@ -312,15 +337,16 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
         var remainingScopes = scopes.Where(s => !resultsById.ContainsKey(s.Id)).ToList();
         var throttled = false;
         JsonNode? throttleDiagnostics = null;
+        var budget = Stopwatch.StartNew();
 
         for (var i = 0; i < remainingScopes.Count; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var scope = remainingScopes[i];
-            if (i >= 20)
+            if (budget.Elapsed >= InteractiveCostScopeBudget)
             {
                 resultsById[scope.Id] = new(scope.Id, scope.Name, 0, null, null,
-                    "not attempted: interactive query limit; use an aggregate scope or cost export");
+                    "not attempted: interactive time budget reached; ask again within five minutes to resume from cache, or use a billing-account scope or cost export");
                 continue;
             }
             var url = $"https://management.azure.com/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/query?api-version={AzureApiVersions.CostQuery}";
