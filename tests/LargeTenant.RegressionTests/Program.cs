@@ -742,6 +742,44 @@ using (var anomalyHttp = new HttpClient(new StubHandler(request =>
         "Every anomalous day still receives its own contributor breakdown from the single query");
 }
 
+var deckSlides = """
+[
+ {"layout":"title","eyebrow":"SCAN","title":"Deck title","subtitle":"Lead line",
+  "bullets":["Cleanup is scriptable","Commitments need visibility"]},
+ {"layout":"section","title":"Divider"},
+ {"layout":"chart","title":"Findings","chart":{"type":"horizontal_bar","title":"Flagged",
+  "labels":["Disks","NICs","Snapshots"],"values":[50,50,44],
+  "colors":["#e74c3c","#7f8c8d","#f39c12"]}},
+ {"layout":"roadmap","title":"Three waves","footnote":"Approval required",
+  "phases":[{"label":"Clean","period":"Days 0-7","accent":"red","items":["Cleanup scripts"]},
+            {"label":"Govern","period":"Days 8-30","accent":"amber","items":["Bulk tag"]}]}
+]
+""";
+var deckResult = await Invoke(
+    HtmlPresentationTools.Create().Single(tool => tool.Name == "GenerateHtmlPresentation"),
+    new AIFunctionArguments { ["slidesJson"] = deckSlides, ["filename"] = "regression-deck" });
+Check(deckResult.StartsWith("__HTML_READY__:", StringComparison.Ordinal), "Deck generation returns a ready marker");
+var deckFileId = deckResult.Split(':')[1];
+var deckHtml = File.ReadAllText(HtmlPresentationTools.GeneratedFiles[deckFileId].Path);
+File.Delete(HtmlPresentationTools.GeneratedFiles[deckFileId].Path);
+
+Check(!deckHtml.Contains("data-i=\"", StringComparison.Ordinal)
+    && System.Text.RegularExpressions.Regex.Matches(deckHtml, "<section class=\"slide").Count
+       == System.Text.RegularExpressions.Regex.Matches(deckHtml, "<div class=\"content\"").Count,
+    "Every slide layout wraps its body in .content, so the flex row cannot squeeze it sideways");
+Check(deckHtml.Contains("s-roadmap", StringComparison.Ordinal)
+    && deckHtml.Contains("s-section", StringComparison.Ordinal)
+    && deckHtml.Contains("roadmap-track anim", StringComparison.Ordinal),
+    "Section and roadmap slides animate in like every other layout");
+Check(deckHtml.Contains("\"#e74c3c\",\"#7f8c8d\",\"#f39c12\"", StringComparison.Ordinal),
+    "Caller-supplied chart colours reach Chart.js instead of collapsing to one palette colour");
+Check(deckHtml.Contains("title-bullets", StringComparison.Ordinal)
+    && deckHtml.Contains("Cleanup is scriptable", StringComparison.Ordinal),
+    "Title-slide bullets are rendered rather than silently dropped");
+Check(!deckHtml.Contains("tension:", StringComparison.Ordinal)
+    && !deckHtml.Contains("s-title-bg", StringComparison.Ordinal),
+    "Bar charts omit line-only options and the dead title-background element is gone");
+
 Console.WriteLine("All large-tenant regression checks passed.");
 
 static void Check(bool condition, string name)

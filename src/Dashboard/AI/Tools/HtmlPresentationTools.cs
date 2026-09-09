@@ -130,7 +130,7 @@ EXAMPLE:
 
         var (html, chartJs) = layout switch
         {
-            "title" => (RenderTitleSlide(idx, first, eyebrow, title, subtitle), ""),
+            "title" => (RenderTitleSlide(idx, first, eyebrow, title, subtitle, bullets), ""),
             "section" => (RenderSectionSlide(idx, first, eyebrow, title, subtitle), ""),
             "kpi" => (RenderKpiSlide(idx, first, title, subtitle, GetKpis(s), bullets), ""),
             "chart" => RenderChartSlide(idx, first, title, subtitle, GetChart(s), bullets),
@@ -155,19 +155,23 @@ EXAMPLE:
     }
 
     private static string RenderSectionSlide(int idx, string first, string? eyebrow, string title, string? subtitle) => $@"
-<section class=""slide s-section{first}"" data-i=""{idx}"">
-  <div class=""section-num"">{idx:00}</div>
-  {(eyebrow is null ? "" : $@"<div class=""eyebrow"">{Esc(eyebrow)}</div>")}
-  <h2 class=""section-title"">{Esc(title)}</h2>
-  {(subtitle is null ? "" : $@"<p class=""section-sub"">{Esc(subtitle)}</p>")}
+<section class=""slide s-section{first}"" data-idx=""{idx}"">
+  <div class=""content"">
+    <div class=""section-num anim d1"">{idx:00}</div>
+    {(eyebrow is null ? "" : $@"<div class=""eyebrow anim d1"">{Esc(eyebrow)}</div>")}
+    <h2 class=""section-title anim d2"">{Esc(title)}</h2>
+    {(subtitle is null ? "" : $@"<p class=""section-sub anim d3"">{Esc(subtitle)}</p>")}
+  </div>
 </section>";
 
     private static string RenderRoadmapSlide(int idx, string first, string title, string? subtitle, List<RoadmapPhase> phases, string? footnote)
     {
         var sb = new StringBuilder();
-        sb.Append($@"<section class=""slide s-roadmap{first}"" data-i=""{idx}""><h2>{Esc(title)}</h2>");
-        if (subtitle is not null) sb.Append($@"<p class=""slide-sub"">{Esc(subtitle)}</p>");
-        sb.Append($@"<div class=""roadmap-track"">");
+        // .content is what gives the slide body its width; without it the flex
+        // row in .slide lays the heading, track and footnote out side by side.
+        sb.Append($@"<section class=""slide s-roadmap{first}"" data-idx=""{idx}""><div class=""content""><h2 class=""section-title anim d1"">{Esc(title)}</h2>");
+        if (subtitle is not null) sb.Append($@"<p class=""section-lead anim d1"">{Esc(subtitle)}</p>");
+        sb.Append($@"<div class=""roadmap-track anim d2"">");
         for (var i = 0; i < phases.Count; i++)
         {
             var p = phases[i];
@@ -178,8 +182,8 @@ EXAMPLE:
 </div>");
         }
         sb.Append("</div>");
-        if (footnote is not null) sb.Append($@"<div class=""maturity-foot"">{Esc(footnote)}</div>");
-        sb.Append("</section>");
+        if (footnote is not null) sb.Append($@"<div class=""maturity-foot anim d3"">{Esc(footnote)}</div>");
+        sb.Append("</div></section>");
         return sb.ToString();
     }
 
@@ -200,14 +204,14 @@ EXAMPLE:
         return list;
     }
 
-    private static string RenderTitleSlide(int idx, string first, string? eyebrow, string title, string? subtitle) => $@"
+    private static string RenderTitleSlide(int idx, string first, string? eyebrow, string title, string? subtitle, List<string>? bullets) => $@"
 <section class=""slide s-title{first}"" data-idx=""{idx}"">
-  <div class=""s-title-bg""></div>
   <div class=""content"">
     {(eyebrow is { Length: > 0 } ? $@"<div class=""eyebrow anim d1"">{Esc(eyebrow)}</div>" : "")}
     <h1 class=""anim d2"">{Esc(title)}</h1>
     {(subtitle is { Length: > 0 } ? $@"<p class=""sub anim d3"">{Esc(subtitle)}</p>" : "")}
-    <div class=""title-meta anim d4""><span>← →</span><span>↑ fullscreen</span></div>
+    {(bullets is { Count: > 0 } ? $@"<ul class=""title-bullets anim d4"">{string.Concat(bullets.Take(3).Select(b => $"<li>{RenderBullet(b)}</li>"))}</ul>" : "")}
+    <div class=""title-meta anim d5""><span>← →</span><span>↑ fullscreen</span></div>
   </div>
 </section>";
 
@@ -511,9 +515,16 @@ EXAMPLE:
 
         var labelsJs = JsonSerializer.Serialize(labels);
         var valuesJs = JsonSerializer.Serialize(values);
-        var bgColors = isCircular
-            ? JsonSerializer.Serialize(labels.Select((_, i) => palette[i % palette.Length]).ToArray())
-            : $"'{palette[0]}'";
+        // Caller-supplied colours carry meaning (severity, category); only fall
+        // back to the house palette when none were given.
+        var supplied = GetStringArray(chart, "colors");
+        var bgColors = supplied is { Count: > 0 }
+            ? JsonSerializer.Serialize(labels.Select((_, i) => supplied[i % supplied.Count]).ToArray())
+            : isCircular
+                ? JsonSerializer.Serialize(labels.Select((_, i) => palette[i % palette.Length]).ToArray())
+                : $"'{palette[0]}'";
+        var isLine = chartType == "line";
+        var lineOptions = isLine ? ", tension:0.35, fill:true" : "";
 
         return $@"
 (function(){{
@@ -521,7 +532,7 @@ EXAMPLE:
   if(!ctx) return;
   new Chart(ctx,{{
     type:'{chartType}',
-    data:{{ labels:{labelsJs}, datasets:[{{ label:{JsonSerializer.Serialize(chartTitle)}, data:{valuesJs}, backgroundColor:{bgColors}, borderColor:'{palette[0]}', borderWidth:2, tension:0.35, fill:{(chartType == "line" ? "true" : "false")} }}] }},
+    data:{{ labels:{labelsJs}, datasets:[{{ label:{JsonSerializer.Serialize(chartTitle)}, data:{valuesJs}, backgroundColor:{bgColors}, borderColor:'{palette[0]}', borderWidth:2{lineOptions} }}] }},
     options:{{
       responsive:true, maintainAspectRatio:false, indexAxis:{indexAxis},
       plugins:{{
@@ -575,6 +586,8 @@ html,body{{height:100%;width:100%;overflow:hidden;font-family:'Inter','Segoe UI'
 .s-title h1{{font-size:clamp(2.6rem,7vw,6rem);font-weight:800;line-height:1;letter-spacing:-.035em;color:var(--ink);margin-bottom:1.2rem}}
 .s-title .eyebrow{{font-size:.85rem;font-weight:700;letter-spacing:.3em;text-transform:uppercase;color:var(--azure-blue);margin-bottom:1.2rem}}
 .s-title .sub{{font-size:clamp(1.1rem,1.6vw,1.5rem);color:var(--ink-soft);max-width:760px;margin:0 auto 2rem;line-height:1.5}}
+.s-title .title-bullets{{list-style:none;display:flex;flex-wrap:wrap;gap:.6rem;justify-content:center;max-width:860px;margin:0 auto 2rem}}
+.s-title .title-bullets li{{font-size:clamp(.95rem,1.2vw,1.1rem);color:var(--ink-soft);padding:.5rem 1rem;background:var(--bg-soft);border:1px solid var(--line);border-radius:999px}}
 .s-title .title-meta{{display:flex;gap:2rem;justify-content:center;font-size:.8rem;color:var(--ink-mute);letter-spacing:.18em;text-transform:uppercase}}
 
 /* Section / content titles */

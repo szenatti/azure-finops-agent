@@ -2312,14 +2312,20 @@
             >
               {{ deckPreviewError }}
             </div>
-            <iframe
-              v-else
-              class="deck-preview-frame"
-              :srcdoc="deckPreviewHtml"
-              sandbox=""
-              referrerpolicy="no-referrer"
-              title="Generated presentation"
-            ></iframe>
+            <template v-else>
+              <p class="deck-preview-note">
+                Static preview — scripts are disabled for safety, so charts,
+                navigation and speaker notes do not render here. Download the
+                file to see the full deck.
+              </p>
+              <iframe
+                class="deck-preview-frame"
+                :srcdoc="deckPreviewHtml"
+                sandbox=""
+                referrerpolicy="no-referrer"
+                title="Generated presentation"
+              ></iframe>
+            </template>
           </div>
         </div>
       </div>
@@ -12352,10 +12358,25 @@ async function send() {
   min-height: 0;
   padding: 10px;
   background: #201f1e;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.deck-preview-note {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: #323130;
+  border-left: 3px solid #0078d4;
+  color: #d2d0ce;
+  font-size: 12px;
+  line-height: 1.45;
 }
 .deck-preview-frame {
+  flex: 1 1 auto;
   width: 100%;
-  height: 100%;
+  min-height: 0;
   border: 0;
   border-radius: 4px;
   background: #fff;
