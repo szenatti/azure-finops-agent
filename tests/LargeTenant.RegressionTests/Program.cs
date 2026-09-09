@@ -531,6 +531,15 @@ Check(groupTools["QueryCostsAcrossSubscriptions"].Description.Contains("never re
     && groupTools["QueryAzure"].Description.Contains("ALWAYS available"),
     "Guidance stops the agent giving up when no billing account is accessible");
 
+// Resume only accumulates coverage if the cache outlives the calls it spans: at ~3.7s per
+// subscription a 227-scope estate needs ~14 minutes of querying across several budgets.
+Check(HttpHelper.CostResponseCacheTtl >= AzureQueryTools.InteractiveCostScopeBudget * 4,
+    "Cost cache outlives at least four full scope budgets, so resumed calls accumulate instead of thrashing");
+Check(AzureQueryTools.InteractiveCostScopeBudget >= TimeSpan.FromSeconds(240)
+    && groupTools["QueryCostsAcrossSubscriptions"].Description.Contains("30 minutes")
+    && !groupTools["QueryCostsAcrossSubscriptions"].Description.Contains("cached for five minutes"),
+    "Scope budget and advertised cache window agree with the configured cache TTL");
+
 using var mgThrottledHttp = new HttpClient(new StubHandler(_ =>
 {
     var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests) { Content = new StringContent("{\"error\":{\"code\":\"429\"}}") };

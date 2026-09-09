@@ -27,7 +27,7 @@ public class AzureQueryTools
 
     // Cached scopes replay without touching the tenant gate, so a wall-clock budget lets a
     // repeated call resume where the previous one stopped instead of re-querying the same head.
-    internal static TimeSpan InteractiveCostScopeBudget = TimeSpan.FromSeconds(90);
+    internal static TimeSpan InteractiveCostScopeBudget = TimeSpan.FromSeconds(240);
 
     // Cost Management dimensions this tool will group by; anything else is rejected before the call.
     internal static readonly string[] CostGroupDimensions =
@@ -82,10 +82,10 @@ CONSUMPTION DEPRECATIONS: usageDetails → use Microsoft.CostManagement/generate
 
 For public retail pricing use https://prices.azure.com (no auth) with ?$filter=armRegionName eq '...' and serviceName eq '...' and armSkuName eq '...'&$top=20.");
 
-        yield return AIFunctionFactory.Create(QueryCostsAcrossSubscriptions, "QueryCostsAcrossSubscriptions", @"Gets COST TOTALS across many subscriptions in ONE agent tool call, optionally broken down by a dimension, plus coverage counts and up to 50 subscription details. Use this whenever the question is 'how much did we spend' across more than one subscription; never loop QueryAzure yourself. It needs no billing-account access, so never refuse an estate-wide question because no billing account is available. Cached results may be up to five minutes old and Azure cost ingestion may lag usage.
+        yield return AIFunctionFactory.Create(QueryCostsAcrossSubscriptions, "QueryCostsAcrossSubscriptions", @"Gets COST TOTALS across many subscriptions in ONE agent tool call, optionally broken down by a dimension, plus coverage counts and up to 50 subscription details. Use this whenever the question is 'how much did we spend' across more than one subscription; never loop QueryAzure yourself. It needs no billing-account access, so never refuse an estate-wide question because no billing account is available. Cached results may be up to 30 minutes old and Azure cost ingestion may lag usage.
 GROUPING — set groupBy to break the estate total down: ServiceName, ResourceGroupName, MeterCategory, MeterSubCategory, ResourceLocation, ResourceType, ChargeType, PublisherType or SubscriptionName. The `byGroup` array then holds the cross-subscription totals per group and currency, cheapest field to chart. Omit groupBy for a plain total per subscription. groupBy has no daily granularity; route per-day series to a single scoped QueryAzure query instead. Supplying groupBy disables the management-group aggregate shortcut.
 Input subscriptionsJson: 'all' for all accessible subscriptions (discovered by the host, never copy a truncated context list), or an explicit JSON array of selected {id,name} scopes. Input managementGroupId: an optional verified containing management group. Dates are yyyy-MM-dd; `to` is the exclusive end date.
-    Uses Cost Management only, never budget evaluations as a live-cost substitute. It tries one supplied management-group aggregate, then queries subscriptions sequentially until a wall-clock budget is reached. Already-queried subscriptions are cached for five minutes and replay instantly, so on a large estate calling this tool again within that window RESUMES from where it stopped — repeat until `unattempted` reaches 0, reporting coverage each time. Stops immediately on throttling; reports partial coverage and unattempted scopes, never a complete total for partial data. On HTTP 429 the `retry` field names the Azure quota that fired — report it verbatim. Never call this tool twice in one turn after a 429.");
+    Uses Cost Management only, never budget evaluations as a live-cost substitute. It tries one supplied management-group aggregate, then queries subscriptions sequentially until a wall-clock budget is reached. Each subscription query takes roughly 3-4 seconds, so one call covers about 60 scopes. Already-queried subscriptions are cached for 30 minutes and replay instantly, so calling this tool again within that window RESUMES from where it stopped — on a large estate say so, report the coverage you have, and offer to continue until `unattempted` reaches 0. Stops immediately on throttling; reports partial coverage and unattempted scopes, never a complete total for partial data. Partial coverage is NOT a proportional sample of the estate: never scale it up or present it as representative. On HTTP 429 the `retry` field names the Azure quota that fired — report it verbatim. Never call this tool twice in one turn after a 429.");
 
 
         yield return AIFunctionFactory.Create(BulkAzureRequest, "BulkAzureRequest", @"Executes MANY Azure ARM READ requests in ONE tool call, in parallel, server-side. Use this whenever you would otherwise loop QueryAzure for the same kind of read across multiple resources (per-resource configuration, properties, inventory detail, quota/usage fan-out).
@@ -372,7 +372,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
             if (budget.Elapsed >= InteractiveCostScopeBudget)
             {
                 resultsById[scope.Id] = new(scope.Id, scope.Name, 0, null, null,
-                    "not attempted: interactive time budget reached; ask again within five minutes to resume from cache, or use a billing-account scope or cost export");
+                    "not attempted: interactive time budget reached; ask again within 30 minutes to resume from cache, or use a billing-account scope or cost export");
                 continue;
             }
             var url = $"https://management.azure.com/subscriptions/{scope.Id}/providers/Microsoft.CostManagement/query?api-version={AzureApiVersions.CostQuery}";
@@ -652,7 +652,7 @@ Use this INSTEAD of looping QueryAzure when you have ≥5 similar reads. Build t
                 && !(result.Status == 200 && result.Error == NoCostRows)),
             unattempted = orderedResults.Count(result => result.Status == 0),
             resultsTruncated = orderedResults.Count > 50,
-            freshness = "Cost Management queries may be cached for five minutes; upstream cost ingestion may lag usage.",
+            freshness = "Cost Management queries may be cached for up to 30 minutes; upstream cost ingestion may lag usage.",
             mixedCurrencies = totalsByCurrency.Count > 1,
             totalCost = complete && safeAggregate ? Math.Round(summedCost!.Value, 6) : (double?)null,
             partialCost = !complete && safeAggregate && succeeded > 0 ? Math.Round(summedCost!.Value, 6) : (double?)null,

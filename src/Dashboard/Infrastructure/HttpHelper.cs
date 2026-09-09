@@ -20,7 +20,11 @@ public static class HttpHelper
     // matches the factory defaults wired up in Program.cs.
     private static readonly HttpClient Http = new(Ipv4HttpHandler.Create())
     { Timeout = TimeSpan.FromSeconds(60) };
-    private static readonly MemoryCache CostResponses = new(new MemoryCacheOptions { SizeLimit = 8 * 1024 * 1024 });
+    private static readonly MemoryCache CostResponses = new(new MemoryCacheOptions { SizeLimit = 32 * 1024 * 1024 });
+
+    // A large estate needs several resumed calls to reach full coverage; a shorter window
+    // expires the earliest scopes before the last call runs, so coverage never accumulates.
+    internal static readonly TimeSpan CostResponseCacheTtl = TimeSpan.FromMinutes(30);
 
     public static readonly ActivitySource Telemetry = new("AzureFinOps.AI");
 
@@ -428,7 +432,7 @@ public static class HttpHelper
             CostResponses.Set(cacheKey, result, new MemoryCacheEntryOptions
             {
                 Size = Encoding.UTF8.GetByteCount(result),
-                AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5)
+                AbsoluteExpirationRelativeToNow = CostResponseCacheTtl
             });
         return result;
     }
