@@ -18,11 +18,7 @@ public static class DownloadEndpoints
             var userId = ResolveUserId(ctx);
             if (userId is null) return Results.Unauthorized();
 
-            if (!HtmlPresentationTools.GeneratedFiles.TryGetValue(fileId, out var entry))
-                return Results.NotFound(new { error = "File not found or expired" });
-
-            // Owner mismatch returns the same 404 as a missing file — no oracle.
-            if (entry.Owner is not null && entry.Owner != userId)
+            if (!HtmlPresentationTools.TryGetOwnedFile(fileId, userId, out var entry))
                 return Results.NotFound(new { error = "File not found or expired" });
 
             if (!File.Exists(entry.Path))
@@ -47,11 +43,7 @@ public static class DownloadEndpoints
             var userId = ResolveUserId(ctx);
             if (userId is null) return Results.Unauthorized();
 
-            if (!ScriptTools.GeneratedFiles.TryGetValue(fileId, out var entry))
-                return Results.NotFound(new { error = "File not found or expired" });
-
-            // Owner mismatch returns the same 404 as a missing file — no oracle.
-            if (entry.Owner is not null && entry.Owner != userId)
+            if (!ScriptTools.TryGetOwnedFile(fileId, userId, out var entry))
                 return Results.NotFound(new { error = "File not found or expired" });
 
             if (!File.Exists(entry.Path))

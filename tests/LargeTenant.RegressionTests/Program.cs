@@ -6,6 +6,291 @@ using AzureFinOps.Dashboard.AI.Tools;
 using AzureFinOps.Dashboard.Auth;
 using AzureFinOps.Dashboard.Infrastructure;
 using Microsoft.Extensions.AI;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging.Abstractions;
+
+var approvedTool = AIFunctionFactory.Create(() => "bounded result", "ApprovedFinOpsTool");
+var allowedTools = AzureFinOps.Dashboard.AI.CopilotSessionFactory.AllowedTools([approvedTool]);
+Check(allowedTools.Contains("custom:ApprovedFinOpsTool") && !allowedTools.Contains("custom:*")
+    && !allowedTools.Contains("builtin:*") && !allowedTools.Any(tool => tool.StartsWith("mcp:")),
+    "Security: runtime tools are restricted to registered host tools and isolated built-ins");
+Check(!new[] { "bash", "powershell", "rg", "task", "view", "edit", "create" }
+    .Any(tool => allowedTools.Contains($"builtin:{tool}")),
+    "Security: unrestricted execution and filesystem tools are unavailable");
+var permissionDecision = await AzureFinOps.Dashboard.AI.CopilotSessionFactory.DenyRuntimePermission(null!, null!);
+Check(permissionDecision.Kind == "reject", "Security: runtime permission requests fail closed");
+var hostPermission = new GitHub.Copilot.PermissionRequestCustomTool
+{
+    ToolName = approvedTool.Name, ToolCallId = Guid.NewGuid().ToString(), ToolDescription = "Synthetic host tool", Args = default!
+};
+Check((await AzureFinOps.Dashboard.AI.CopilotSessionFactory.AuthorizeHostTool(hostPermission, null!, [approvedTool])).Kind == "approve-once",
+    "Security: registered host tools remain usable under the restricted runtime policy");
+Check((await AzureFinOps.Dashboard.AI.CopilotSessionFactory.AuthorizeHostTool(hostPermission, null!, [])).Kind == "reject",
+    "Security: unregistered custom tools cannot obtain execution permission");
+if (args.Contains("--runtime-policy-only")) return;
+
+var artifactOwner = Random.Shared.NextInt64();
+var artifactId = Guid.NewGuid().ToString("N");
+var artifactPath = Path.GetTempFileName();
+try
+{
+    foreach (var owner in new long?[] { artifactOwner, null, artifactOwner ^ 1 })
+    {
+        ScriptTools.GeneratedFiles[artifactId] = (artifactPath, DateTime.UtcNow, "synthetic document", owner);
+        HtmlPresentationTools.GeneratedFiles[artifactId] = (artifactPath, DateTime.UtcNow, owner);
+        Check(ScriptTools.TryGetOwnedFile(artifactId, artifactOwner, out _) == (owner == artifactOwner)
+            && HtmlPresentationTools.TryGetOwnedFile(artifactId, artifactOwner, out _) == (owner == artifactOwner),
+            "Security: artifacts require exact non-null host ownership");
+    }
+    ScriptTools.GeneratedFiles[artifactId] = (artifactPath, DateTime.UtcNow.AddHours(-1), "expired", artifactOwner);
+    Check(!ScriptTools.TryGetOwnedFile(artifactId, artifactOwner, out var expired) && expired.Content is null,
+        "Security: expired artifact content is not returned");
+    Check(!HtmlPresentationTools.TryGetOwnedFile(artifactId, null, out _), "Security: missing caller cannot retrieve artifacts");
+    foreach (var tool in ScriptTools.Create().Concat(DocumentTools.Create()).Concat(HtmlPresentationTools.Create()).Concat(MaturityReportTools.Create()))
+    {
+        var rejected = await Invoke(tool, new AIFunctionArguments
+        {
+            ["scriptContent"] = "synthetic", ["documentContent"] = "synthetic", ["slidesJson"] = "[]", ["reportJson"] = "{}",
+            ["filename"] = "synthetic", ["language"] = "bash", ["description"] = "synthetic", ["format"] = "text"
+        });
+        Check(rejected.Contains("owner is unavailable"), "Security: artifact generation without host ownership fails closed");
+    }
+}
+finally
+{
+    File.Delete(artifactPath);
+    ScriptTools.GeneratedFiles.TryRemove(artifactId, out _);
+    HtmlPresentationTools.GeneratedFiles.TryRemove(artifactId, out _);
+}
+if (args.Contains("--artifact-policy-only")) return;
+
+Check(PublicWebClient.IsAllowedUri(new Uri("https://docs.example.invalid/reference")), "Security: public HTTPS URL shape is supported");
+Check(!PublicWebClient.IsAllowedUri(new Uri("http://docs.example.invalid"))
+    && !PublicWebClient.IsAllowedUri(new Uri("https://docs.example.invalid:444"))
+    && !PublicWebClient.IsAllowedUri(new Uri("https://localhost")), "Security: non-public URL shapes fail closed");
+foreach (var address in new[] { IPAddress.Loopback, IPAddress.IPv6Loopback, IPAddress.Any, IPAddress.IPv6Any,
+    IPAddress.Parse("192.0.2.1"), IPAddress.Parse("2001:db8::1"), IPAddress.Parse("fe80::1"), IPAddress.Parse("fc00::1") })
+    Check(!PublicWebClient.IsPublicAddress(address), "Security: reserved addresses are not public web destinations");
+var redirectRequests = 0;
+using (var publicHttp = new HttpClient(new StubHandler(request =>
+{
+    redirectRequests++;
+    if (redirectRequests == 1)
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.Found);
+        response.Headers.Location = new Uri("http://docs.example.invalid/unsupported");
+        return response;
+    }
+    throw new InvalidOperationException("Unvalidated redirect reached transport");
+})))
+{
+    var blockedRedirect = false;
+    try { await PublicWebClient.ReadAsync(publicHttp, new Uri("https://docs.example.invalid"), CancellationToken.None); }
+    catch (HttpRequestException) { blockedRedirect = true; }
+    Check(blockedRedirect && redirectRequests == 1, "Security: every redirect is validated before sending");
+}
+using (var publicHttp = new HttpClient(new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+    { Content = new StringContent(new string('a', PublicWebClient.MaxBytes + 10)) })))
+{
+    var page = await PublicWebClient.ReadAsync(publicHttp, new Uri("https://docs.example.invalid"), CancellationToken.None);
+    Check(page.Bytes == PublicWebClient.MaxBytes, "Security: public web response reads are bounded");
+}
+var safeRedirectCount = 0;
+using (var publicHttp = new HttpClient(new StubHandler(_ =>
+{
+    if (++safeRedirectCount > 1) return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("Synthetic public page") };
+    var response = new HttpResponseMessage(HttpStatusCode.Found);
+    response.Headers.Location = new Uri("/reference", UriKind.Relative);
+    return response;
+})))
+{
+    var page = await PublicWebClient.ReadAsync(publicHttp, new Uri("https://docs.example.invalid"), CancellationToken.None);
+    Check(page.Uri.AbsolutePath == "/reference" && page.Body == "Synthetic public page" && safeRedirectCount == 2,
+        "Security: valid public relative redirects remain usable");
+}
+var redirectLoopCount = 0;
+using (var publicHttp = new HttpClient(new StubHandler(_ =>
+{
+    redirectLoopCount++;
+    var response = new HttpResponseMessage(HttpStatusCode.TemporaryRedirect);
+    response.Headers.Location = new Uri("https://docs.example.invalid/loop");
+    return response;
+})))
+{
+    var stopped = false;
+    try { await PublicWebClient.ReadAsync(publicHttp, new Uri("https://docs.example.invalid"), CancellationToken.None); }
+    catch (HttpRequestException) { stopped = true; }
+    Check(stopped && redirectLoopCount == 6, "Security: public redirects cannot loop indefinitely");
+}
+using (var cancelledRead = new CancellationTokenSource())
+using (var publicHttp = new HttpClient(new CancelOnRequestHandler()))
+{
+    cancelledRead.Cancel();
+    var cancelled = false;
+    try { await PublicWebClient.ReadAsync(publicHttp, new Uri("https://docs.example.invalid"), cancelledRead.Token); }
+    catch (OperationCanceledException) { cancelled = true; }
+    Check(cancelled, "Security: public fetch respects cancellation");
+}
+if (args.Contains("--web-policy-only")) return;
+
+var identityRoot = Path.Combine(Path.GetTempPath(), $"finops-auth-{Guid.NewGuid():N}");
+var identityClock = new TestClock();
+var identityProvider = new EphemeralDataProtectionProvider();
+var identityStore = new PersistentIdentity(identityProvider, NullLogger<PersistentIdentity>.Instance,
+    new MicrosoftOAuthOptions(), identityClock, identityRoot);
+var syntheticOid = Guid.NewGuid().ToString();
+var syntheticIdentity = new IdentityRecord
+{
+    Oid = syntheticOid, TenantId = Guid.NewGuid().ToString(), UserId = PersistentIdentity.DeriveUserId(syntheticOid),
+    RefreshToken = "synthetic-refresh-credential"
+};
+try
+{
+    var signedIn = new DefaultHttpContext { Session = new RegressionSession() };
+    await identityStore.SaveIdentityAsync(signedIn, syntheticIdentity);
+    var browser = new DefaultHttpContext { Session = new RegressionSession() };
+    var cookie = Microsoft.Net.Http.Headers.SetCookieHeaderValue.Parse(signedIn.Response.Headers.SetCookie.Single()!).Value.ToString();
+    browser.Request.Headers.Cookie = $"finops_id={cookie}";
+    Check(identityStore.Load(browser)?.Oid == syntheticOid, "Security: issued browser ticket restores only its recorded identity");
+    var legacyBrowser = new DefaultHttpContext { Session = new RegressionSession() };
+    legacyBrowser.Request.Headers.Cookie = "finops_id=" + identityProvider.CreateProtector("FinOps.Identity.v1").Protect(syntheticOid);
+    Check(identityStore.Load(legacyBrowser) is null, "Security: legacy unexpiring cookies cannot authenticate");
+    Check(identityStore.RestoreSession(browser) && browser.Session.GetString("azure_user") is not null,
+        "Security: a validated ticket hydrates browser identity");
+    browser.Session.SetString("azure_user", JsonSerializer.Serialize(new { objectId = Guid.NewGuid().ToString(), tenantId = Guid.NewGuid().ToString() }));
+    browser.Session.SetString("azure_token", "synthetic-other-account-token");
+    Check(identityStore.RestoreSession(browser) && browser.Session.GetString("azure_token") is null,
+        "Security: ticket restoration never carries another account's access token");
+    identityClock.Advance(TimeSpan.FromHours(7));
+    await identityStore.UpdateRefreshTokenAsync(syntheticOid, "rotated-synthetic-credential");
+    browser.Response.Headers.Clear();
+    identityStore.SetIdentityCookie(browser, syntheticOid);
+    var refreshedCookie = Microsoft.Net.Http.Headers.SetCookieHeaderValue.Parse(browser.Response.Headers.SetCookie.Single()!).Value.ToString();
+    browser.Request.Headers.Cookie = $"finops_id={refreshedCookie}";
+    Check(identityStore.Load(browser) is not null, "Security: browser ticket remains usable before absolute expiry");
+    identityClock.Advance(TimeSpan.FromHours(1));
+    Check(identityStore.Load(browser) is null && identityStore.LoadByOid(syntheticOid)?.RefreshToken == "rotated-synthetic-credential",
+        "Security: browser expiry is absolute and does not remove scheduled-job credentials");
+    Check(!identityStore.RestoreSession(browser) && browser.Session.GetString("user") is null
+        && browser.Session.GetString("azure_refresh_token") is null && browser.Items.ContainsKey("finops.authenticationExpired"),
+        "Security: an already-hydrated session cannot bypass ticket expiry");
+    await identityStore.UpdateRefreshTokenAsync(syntheticOid, "cache-probe-credential");
+    Check(identityStore.LoadByOid(syntheticOid)?.RefreshToken == "cache-probe-credential",
+        "Security: a write invalidates the cached identity record");
+    var mutatedRecord = identityStore.LoadByOid(syntheticOid)!;
+    mutatedRecord.RefreshToken = "locally-mutated-credential";
+    Check(identityStore.LoadByOid(syntheticOid)?.RefreshToken == "cache-probe-credential",
+        "Security: cached identity reads never share a mutable record");
+    var freshLogin = new DefaultHttpContext { Session = new RegressionSession() };
+    await identityStore.SaveIdentityAsync(freshLogin, syntheticIdentity);
+    browser.Request.Headers.Cookie = "finops_id=" + Microsoft.Net.Http.Headers.SetCookieHeaderValue.Parse(freshLogin.Response.Headers.SetCookie.Single()!).Value;
+    Check(identityStore.Load(browser) is not null, "Security: verified reauthentication can issue a fresh ticket");
+    identityStore.Clear(browser, syntheticOid);
+    await identityStore.SaveIdentityAsync(new DefaultHttpContext { Session = new RegressionSession() }, syntheticIdentity);
+    Check(identityStore.Load(browser) is null, "Security: revoked browser tickets stay revoked after a new login");
+    var disconnectLogin = new DefaultHttpContext { Session = new RegressionSession() };
+    await identityStore.SaveIdentityAsync(disconnectLogin, syntheticIdentity);
+    browser.Request.Headers.Cookie = "finops_id=" + Microsoft.Net.Http.Headers.SetCookieHeaderValue.Parse(disconnectLogin.Response.Headers.SetCookie.Single()!).Value;
+    identityStore.Clear(browser, null);
+    Check(identityStore.Load(browser) is null && identityStore.LoadByOid(syntheticOid)?.RefreshToken is not null,
+        "Security: disconnect revokes copied browser tickets while preserving job credentials");
+}
+finally { if (Directory.Exists(identityRoot)) Directory.Delete(identityRoot, recursive: true); }
+var authNow = DateTimeOffset.UtcNow;
+Check(IdTokenValidator.IsFreshAuthentication(authNow.ToUnixTimeSeconds(), authNow, authNow)
+    && !IdTokenValidator.IsFreshAuthentication(null, authNow, authNow)
+    && !IdTokenValidator.IsFreshAuthentication(authNow.AddHours(-1).ToUnixTimeSeconds(), authNow, authNow),
+    "Security: forced sign-in requires a recent signed authentication time");
+if (args.Contains("--auth-policy-only")) return;
+
+var quotaClock = new TestClock();
+var workloadQuota = new WorkloadQuota(new WorkloadOptions { MaxConcurrentTurns = 2, MaxConcurrentAnonymousTurns = 1,
+    AnonymousTurnsPerHour = 1, GlobalAnonymousTurnsPerHour = 2, UploadedFilesPerUser = 1, AnonymousUploadedFilesPerUser = 1 }, quotaClock);
+var quotaOwner = Random.Shared.NextInt64();
+using (var firstTurn = workloadQuota.TryStartTurn(quotaOwner, false, out _))
+{
+    Check(firstTurn is not null && workloadQuota.TryStartTurn(quotaOwner ^ 1, false, out _) is null,
+        "Security: concurrent anonymous turns are capped across browsers");
+    using var signedInTurn = workloadQuota.TryStartTurn(quotaOwner ^ 2, true, out _);
+    Check(signedInTurn is not null && workloadQuota.TryStartTurn(quotaOwner ^ 3, true, out _) is null,
+        "Security: chat and jobs share global turn concurrency");
+}
+using (var secondBrowser = workloadQuota.TryStartTurn(quotaOwner ^ 1, false, out _))
+    Check(secondBrowser is not null, "Security: each anonymous browser keeps its own hourly allowance");
+Check(workloadQuota.TryStartTurn(quotaOwner, false, out var quotaRetry) is null && quotaRetry > 0,
+    "Security: an anonymous browser cannot exceed its own hourly budget");
+Check(workloadQuota.TryStartTurn(quotaOwner ^ 9, false, out _) is null,
+    "Security: the global anonymous ceiling caps cookie-clearing abuse");
+quotaClock.Advance(TimeSpan.FromHours(1));
+using (var renewedTurn = workloadQuota.TryStartTurn(quotaOwner, false, out _))
+    Check(renewedTurn is not null, "Security: quota windows expire without being renewed by rejection");
+using (var uploadLease = workloadQuota.TryReserveUpload(quotaOwner, false, 100))
+{
+    Check(uploadLease is not null && workloadQuota.TryReserveUpload(quotaOwner, false, 100) is null,
+        "Security: upload reservations atomically enforce file count");
+}
+using (var uploadLease = workloadQuota.TryReserveUpload(quotaOwner, false, 100))
+    Check(uploadLease is not null, "Security: released upload reservations restore capacity");
+Check(workloadQuota.TryReserveUpload(quotaOwner, false, 11L * 1024 * 1024) is null,
+    "Security: anonymous uploads have a lower byte limit");
+var guardedRequests = new WorkloadQuota(new WorkloadOptions { AnonymousRequestsPerHour = 1, GlobalAnonymousRequestsPerHour = 2 });
+var guardedBrowser = Random.Shared.NextInt64();
+var requestExecutions = 0;
+for (var requestIndex = 0; requestIndex < 2; requestIndex++)
+{
+    var context = new DefaultHttpContext { Session = new RegressionSession() };
+    context.Session.SetString("user", JsonSerializer.Serialize(new { id = guardedBrowser }));
+    context.Request.Method = "POST";
+    context.Request.Path = requestIndex == 0 ? "/api/chat/warmup" : "/API/CHAT/WARMUP/";
+    context.Response.Body = new MemoryStream();
+    await guardedRequests.GuardRequestAsync(context, () => { requestExecutions++; return Task.CompletedTask; });
+    if (requestIndex == 1)
+        Check(context.Response.StatusCode == 429 && context.Response.Headers.RetryAfter.Count == 1,
+            "Security: rejected workloads receive a retry hint before endpoint execution");
+}
+Check(requestExecutions == 1, "Security: one anonymous browser cannot exceed its own request budget");
+foreach (var (browser, admitted) in new[] { (guardedBrowser ^ 1, true), (guardedBrowser ^ 2, false) })
+{
+    var context = new DefaultHttpContext { Session = new RegressionSession() };
+    context.Session.SetString("user", JsonSerializer.Serialize(new { id = browser }));
+    context.Request.Method = "POST";
+    context.Request.Path = "/api/chat/warmup";
+    context.Response.Body = new MemoryStream();
+    var executed = false;
+    await guardedRequests.GuardRequestAsync(context, () => { executed = true; return Task.CompletedTask; });
+    Check(executed == admitted, admitted
+        ? "Security: a separate anonymous browser is admitted on its own budget"
+        : "Security: the global anonymous request ceiling caps cookie-clearing abuse");
+}
+using (var firstUploadRequest = guardedRequests.TryStartRequest(true))
+using (var secondUploadRequest = guardedRequests.TryStartRequest(true))
+    Check(firstUploadRequest is not null && secondUploadRequest is not null && guardedRequests.TryStartRequest(true) is null,
+        "Security: concurrent multipart buffering is bounded before body parsing");
+var retainedQuota = new WorkloadQuota(new WorkloadOptions { AnonymousUploadedFilesPerUser = 1 });
+var uploadOwner = Random.Shared.NextInt64();
+try
+{
+    var uploaded = await UploadedFileTools.RegisterAsync(uploadOwner, new MemoryStream([1, 2, 3]), "synthetic.png", 3, quotas: retainedQuota);
+    UploadedFileTools.RemoveForUser(uploadOwner, uploaded.Entry.FileId);
+    Check(retainedQuota.TryReserveUpload(uploadOwner, false, 3) is null,
+        "Security: delisted attachments still count while their files remain on disk");
+    UploadedFileTools.ClearForUser(uploadOwner);
+    using var capacity = retainedQuota.TryReserveUpload(uploadOwner, false, 3);
+    Check(capacity is not null && !File.Exists(uploaded.Entry.Path), "Security: deleting retained files releases reserved capacity");
+}
+finally { UploadedFileTools.ClearForUser(uploadOwner); }
+var textUploadOwner = Random.Shared.NextInt64();
+try
+{
+    var text = Encoding.UTF8.GetBytes("Synthetic bounded file preview");
+    var uploaded = await UploadedFileTools.RegisterAsync(textUploadOwner, new MemoryStream(text), "synthetic.txt", text.Length,
+        quotas: new WorkloadQuota(new WorkloadOptions()));
+    using var preview = JsonDocument.Parse(uploaded.PreviewJson);
+    Check(preview.RootElement.GetProperty("ok").GetBoolean(), "Security: bounded file inspection still returns a real text preview");
+}
+finally { UploadedFileTools.ClearForUser(textUploadOwner); }
+if (args.Contains("--quota-policy-only")) return;
 
 var callbackOwner = Random.Shared.NextInt64();
 Func<int, double, string, string, int, Task> noOpReporter = (_, _, _, _, _) => Task.CompletedTask;
@@ -887,7 +1172,7 @@ var deckSlides = """
 ]
 """;
 var deckResult = await Invoke(
-    HtmlPresentationTools.Create().Single(tool => tool.Name == "GenerateHtmlPresentation"),
+    new SessionBoundTool(HtmlPresentationTools.Create().Single(tool => tool.Name == "GenerateHtmlPresentation"), artifactOwner, Guid.NewGuid().ToString()),
     new AIFunctionArguments { ["slidesJson"] = deckSlides, ["filename"] = "regression-deck" });
 Check(deckResult.StartsWith("__HTML_READY__:", StringComparison.Ordinal), "Deck generation returns a ready marker");
 var deckFileId = deckResult.Split(':')[1];
@@ -920,7 +1205,7 @@ Check(!deckHtml.Contains("cdn.jsdelivr.net", StringComparison.Ordinal)
 {
     const string documentBody = "# Discovery\n\n| Item | Value |\n| --- | --- |\n| Scope | 2 subs |\n";
     var documentResult = await Invoke(
-        DocumentTools.Create().Single(tool => tool.Name == "GenerateDocument"),
+        new SessionBoundTool(DocumentTools.Create().Single(tool => tool.Name == "GenerateDocument"), artifactOwner, Guid.NewGuid().ToString()),
         new AIFunctionArguments
         {
             ["documentContent"] = documentBody,
@@ -999,4 +1284,18 @@ sealed class TestClock : TimeProvider
     private DateTimeOffset _now = DateTimeOffset.Parse("2026-09-08T00:00:00Z");
     public override DateTimeOffset GetUtcNow() => _now;
     public void Advance(TimeSpan duration) => _now += duration;
+}
+
+sealed class RegressionSession : ISession
+{
+    private readonly Dictionary<string, byte[]> _values = new();
+    public bool IsAvailable => true;
+    public string Id { get; } = Guid.NewGuid().ToString();
+    public IEnumerable<string> Keys => _values.Keys;
+    public void Clear() => _values.Clear();
+    public Task CommitAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+    public Task LoadAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+    public void Remove(string key) => _values.Remove(key);
+    public void Set(string key, byte[] value) => _values[key] = value;
+    public bool TryGetValue(string key, out byte[] value) => _values.TryGetValue(key, out value!);
 }

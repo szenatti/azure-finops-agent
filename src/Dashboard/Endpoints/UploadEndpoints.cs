@@ -1,5 +1,6 @@
 using System.Text.Json;
 using AzureFinOps.Dashboard.AI.Tools;
+using AzureFinOps.Dashboard.Infrastructure;
 
 namespace AzureFinOps.Dashboard.Endpoints;
 
@@ -14,7 +15,7 @@ public static class UploadEndpoints
 
     public static void MapUploadEndpoints(this IEndpointRouteBuilder app)
     {
-        app.MapPost("/api/upload", async (HttpContext ctx, ILoggerFactory loggerFactory) =>
+        app.MapPost("/api/upload", async (HttpContext ctx, ILoggerFactory loggerFactory, WorkloadQuota quotas) =>
         {
             var logger = loggerFactory.CreateLogger("AzureFinOps.Upload");
             var userJson = ctx.Session.GetString("user");
@@ -24,7 +25,9 @@ public static class UploadEndpoints
             if (!ctx.Request.HasFormContentType)
                 return Results.BadRequest(new { error = "multipart/form-data required" });
 
-            var form = await ctx.Request.ReadFormAsync();
+            using var uploadDeadline = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
+            uploadDeadline.CancelAfter(TimeSpan.FromMinutes(2));
+            var form = await ctx.Request.ReadFormAsync(uploadDeadline.Token);
             if (form.Files.Count == 0)
                 return Results.BadRequest(new { error = "no file in request" });
 
@@ -45,7 +48,8 @@ public static class UploadEndpoints
                 try
                 {
                     await using var stream = file.OpenReadStream();
-                    var (entry, previewJson) = await UploadedFileTools.RegisterAsync(userId, stream, file.FileName, file.Length);
+                    var (entry, previewJson) = await UploadedFileTools.RegisterAsync(userId, stream, file.FileName, file.Length,
+                        ctx.Session.GetString("browser_authenticated") == "1", quotas, uploadDeadline.Token);
                     object preview;
                     try
                     {
@@ -66,6 +70,7 @@ public static class UploadEndpoints
                         preview
                     });
                 }
+                catch (OperationCanceledException) when (uploadDeadline.IsCancellationRequested) { throw; }
                 catch (InvalidOperationException ex)
                 {
                     results.Add(new { ok = false, fileName = file.FileName, error = ex.Message });
@@ -83,8 +88,7 @@ public static class UploadEndpoints
 
             return Results.Ok(new { files = results });
         })
-        .DisableAntiforgery()
-        .WithMetadata(new Microsoft.AspNetCore.Mvc.RequestSizeLimitAttribute(MaxBytes + 10L * 1024 * 1024)); // file cap + multipart overhead
+        .DisableAntiforgery();
 
         app.MapGet("/api/uploads", (HttpContext ctx) =>
         {

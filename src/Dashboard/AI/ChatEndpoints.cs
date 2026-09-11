@@ -8,6 +8,8 @@ using GitHub.Copilot;
 
 namespace AzureFinOps.Dashboard.AI;
 
+using AzureFinOps.Dashboard.Infrastructure;
+
 /// <summary>
 /// SSE chat endpoint and session reset. Owns the streaming handler, structured
 /// marker parsing (chart / html / script / maturity), and the per-request
@@ -123,8 +125,10 @@ public static class ChatEndpoints
         CopilotSessionFactory copilotFactory,
         SessionTokenStore tokenStore,
         AiTelemetry telemetry,
-        ILogger logger)
+        ILogger logger,
+        WorkloadQuota? workloadQuota = null)
     {
+        workloadQuota ??= WorkloadQuota.Default;
         app.MapPost("/api/chat", async (HttpContext ctx, IHttpClientFactory httpFactory) =>
         {
             var userJson = ctx.Session.GetString("user");
@@ -153,6 +157,21 @@ public static class ChatEndpoints
             var user = JsonSerializer.Deserialize<JsonElement>(userJson);
             var userId = user.GetProperty("id").GetInt64();
             var userLogin = user.TryGetProperty("login", out var loginProp) ? loginProp.GetString() : userId.ToString();
+
+            var authenticated = ctx.Session.GetString("browser_authenticated") == "1";
+            var maxPromptCharacters = authenticated ? workloadQuota.Options.MaxPromptCharacters : workloadQuota.Options.AnonymousMaxPromptCharacters;
+            if (prompt.Length > maxPromptCharacters)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+                await ctx.Response.WriteAsJsonAsync(new { error = $"Prompt exceeds the {maxPromptCharacters}-character limit." });
+                return;
+            }
+            using var turnQuota = workloadQuota.TryStartTurn(userId, authenticated, out var retryAfterSeconds);
+            if (turnQuota is null)
+            {
+                await WorkloadQuota.RejectAsync(ctx, retryAfterSeconds);
+                return;
+            }
 
             // Entra-connected users get persistent per-oid session storage; anonymous
             // users get an ephemeral working dir that won't appear in any list.
@@ -894,12 +913,12 @@ public static class ChatEndpoints
         // runtime, ~300 ms) that would otherwise sit on the critical path. The
         // frontend calls this once on mount / when identity resolves. It is a
         // no-op-cheap fast path on repeat calls (the live session is cached and
-        // mapped as the user's current). We return immediately — the heavy work
-        // must not block the request or touch the SSE turn gate.
-        app.MapPost("/api/chat/warmup", (HttpContext ctx) =>
+        // mapped as the user's current). The browser does not await this request;
+        // keep the request alive so admission accounts for session creation.
+        app.MapPost("/api/chat/warmup", async (HttpContext ctx) =>
         {
             var userJson = ctx.Session.GetString("user");
-            if (userJson is null) { ctx.Response.StatusCode = 401; return Task.CompletedTask; }
+            if (userJson is null) { ctx.Response.StatusCode = 401; return; }
 
             var user = JsonSerializer.Deserialize<JsonElement>(userJson);
             var userId = user.GetProperty("id").GetInt64();
@@ -918,13 +937,10 @@ public static class ChatEndpoints
                 catch { /* ignore malformed session blob */ }
             }
 
-            _ = Task.Run(async () =>
-            {
-                try { await copilotFactory.GetCurrentOrCreateAsync(userId, userLogin!, entraOid); }
-                catch (Exception ex) { logger.LogWarning(ex, "Session warm-up failed for user {UserId}", userId); }
-            });
+            try { await copilotFactory.GetCurrentOrCreateAsync(userId, userLogin!, entraOid); }
+            catch (Exception ex) { logger.LogWarning(ex, "Session warm-up failed for user {UserId}", userId); }
             ctx.Response.StatusCode = 202;
-            return ctx.Response.WriteAsJsonAsync(new { warming = true });
+            await ctx.Response.WriteAsJsonAsync(new { warming = true });
         });
 
         // Explicit user Stop. A bare browser disconnect is deliberately NOT a stop
@@ -1082,7 +1098,7 @@ public static class ChatEndpoints
         }
         else if (evt is ToolExecutionCompleteEvent toolDone)
         {
-            sseData = await HandleToolDoneAsync(toolDone, emit, toolTracker, telemetry, userLogin, logger);
+            sseData = await HandleToolDoneAsync(toolDone, emit, toolTracker, telemetry, userId, userLogin, logger);
         }
         else if (evt is SessionTitleChangedEvent titleEvt)
         {
@@ -1117,6 +1133,7 @@ public static class ChatEndpoints
         Func<string, Task> emit,
         ConcurrentDictionary<string, (string Name, DateTimeOffset StartTime, Activity? Activity)> toolTracker,
         AiTelemetry telemetry,
+        long userId,
         string userLogin,
         ILogger logger)
     {
@@ -1214,7 +1231,8 @@ public static class ChatEndpoints
             catch (Exception ex) { logger.LogWarning(ex, "Failed to emit __CHART__ marker"); }
         }
 
-        if (toolDone.Data.Success && resultText is not null && resultText.Contains("__HTML_READY__:"))
+        if (toolName is "GenerateHtmlPresentation" or "GenerateMaturityReport"
+            && toolDone.Data.Success && resultText is not null && resultText.Contains("__HTML_READY__:"))
         {
             try
             {
@@ -1226,6 +1244,7 @@ public static class ChatEndpoints
                         var parts = trimmed["__HTML_READY__:".Length..].Split(':', 3);
                         if (parts.Length >= 2)
                         {
+                            if (!HtmlPresentationTools.TryGetOwnedFile(parts[0], userId, out _)) return sseData;
                             var htmlPayload = JsonSerializer.Serialize(new { type = "html_ready", fileId = parts[0], fileName = parts[1], slideCount = parts.Length > 2 ? parts[2] : "" });
                             await emit(sseData);
                             await emit(htmlPayload);
@@ -1239,7 +1258,8 @@ public static class ChatEndpoints
             catch (Exception ex) { logger.LogWarning(ex, "Failed to emit __HTML_READY__ marker"); }
         }
 
-        if (toolDone.Data.Success && resultText is not null && resultText.Contains("__SCRIPT_READY__:"))
+        if (toolName is "GenerateScript" or "GenerateDocument"
+            && toolDone.Data.Success && resultText is not null && resultText.Contains("__SCRIPT_READY__:"))
         {
             try
             {
@@ -1252,9 +1272,8 @@ public static class ChatEndpoints
                         if (parts.Length >= 4)
                         {
                             var scriptFileId = parts[0];
-                            var scriptContent = "";
-                            if (ScriptTools.GeneratedFiles.TryGetValue(scriptFileId, out var scriptEntry))
-                                scriptContent = scriptEntry.Content ?? "";
+                            if (!ScriptTools.TryGetOwnedFile(scriptFileId, userId, out var scriptEntry)) return sseData;
+                            var scriptContent = scriptEntry.Content ?? "";
                             var scriptPayload = JsonSerializer.Serialize(new { type = "script_ready", fileId = parts[0], fileName = parts[1], lineCount = parts[2], language = parts[3], description = parts.Length > 4 ? parts[4] : "", content = scriptContent });
                             await emit(sseData);
                             await emit(scriptPayload);

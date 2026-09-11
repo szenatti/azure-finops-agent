@@ -19,6 +19,20 @@ public static class ScriptTools
     // rejects other users' sessions (fileIds leak into logs/telemetry).
     internal static readonly ConcurrentDictionary<string, (string Path, DateTime Created, string Content, long? Owner)> GeneratedFiles = new();
 
+    internal static bool TryGetOwnedFile(string fileId, long? userId,
+        out (string Path, DateTime Created, string Content, long? Owner) entry)
+    {
+        if (userId.HasValue && GeneratedFiles.TryGetValue(fileId, out var candidate)
+            && candidate.Owner == userId && candidate.Created > DateTime.UtcNow.AddMinutes(-30)
+            && File.Exists(candidate.Path))
+        {
+            entry = candidate;
+            return true;
+        }
+        entry = default;
+        return false;
+    }
+
     internal static void CleanupOldFiles() =>
         TempFileHelper.CleanupOldFiles(GeneratedFiles, v => v.Created, v => v.Path);
 
@@ -51,6 +65,8 @@ Example header:
         [Description("Script language: 'bash' for .sh (Azure CLI), 'powershell' for .ps1. Default: 'bash'")] string? language,
         [Description("Brief description of what the script does (shown in the UI download button)")] string? description)
     {
+        var owner = HttpHelper.CurrentTurnUserId();
+        if (!owner.HasValue) return Task.FromResult("Error: Artifact owner is unavailable.");
         if (string.IsNullOrWhiteSpace(scriptContent))
             return Task.FromResult("Error: No script content provided.");
 
@@ -65,7 +81,7 @@ Example header:
 
         File.WriteAllText(outputPath, scriptContent, Encoding.UTF8);
 
-        GeneratedFiles[fileId] = (outputPath, DateTime.UtcNow, scriptContent, HttpHelper.CurrentTurnUserId());
+        GeneratedFiles[fileId] = (outputPath, DateTime.UtcNow, scriptContent, owner);
 
         var lineCount = scriptContent.Split('\n').Length;
 

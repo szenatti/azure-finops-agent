@@ -33,14 +33,17 @@ namespace AzureFinOps.Dashboard.Auth;
 public sealed class PersistentIdentity
 {
     private const string IdentityCookieName = "finops_id";
-    private static readonly TimeSpan CookieLifetime = TimeSpan.FromDays(30);
 
     private static readonly string CopilotHome =
         Environment.GetEnvironmentVariable("COPILOT_HOME")
         ?? Path.Combine(Path.GetTempPath(), "copilot");
 
     private readonly IDataProtector _protector;
+    private readonly IDataProtector _ticketProtector;
     private readonly ILogger<PersistentIdentity> _logger;
+    private readonly TimeProvider _clock;
+    private readonly TimeSpan _ticketLifetime;
+    private readonly string _root;
 
     // Per-oid serialization lock so concurrent SaveIdentity / UpdateRefreshToken
     // / UpdateGraphTier calls can't race on the same file. Cheap: one Semaphore
@@ -55,10 +58,27 @@ public sealed class PersistentIdentity
     // touched the system in this process, lookup is O(1).
     private static readonly ConcurrentDictionary<long, string> _userIdToOid = new();
 
-    public PersistentIdentity(IDataProtectionProvider provider, ILogger<PersistentIdentity> logger)
+    // /home is an Azure Files SMB mount and every authenticated request validates the
+    // browser ticket against the record, so the decrypted JSON is cached briefly. Caching
+    // the text (not the object) keeps callers that mutate RefreshToken off a shared instance.
+    private static readonly TimeSpan RecordCacheTtl = TimeSpan.FromSeconds(15);
+    private readonly ConcurrentDictionary<string, (string Json, DateTimeOffset Expires)> _recordCache = new();
+
+    public PersistentIdentity(IDataProtectionProvider provider, ILogger<PersistentIdentity> logger,
+        MicrosoftOAuthOptions? options = null)
+        : this(provider, logger, options ?? new MicrosoftOAuthOptions(), TimeProvider.System, CopilotHome) { }
+
+    internal PersistentIdentity(IDataProtectionProvider provider, ILogger<PersistentIdentity> logger,
+        MicrosoftOAuthOptions options, TimeProvider clock, string root)
     {
+        if (options.AuthenticationLifetimeHours is < 1 or > 168)
+            throw new ArgumentOutOfRangeException(nameof(options), "Authentication lifetime must be between 1 and 168 hours.");
         _protector = provider.CreateProtector("FinOps.Identity.v1");
+        _ticketProtector = provider.CreateProtector("FinOps.BrowserTicket.v2");
         _logger = logger;
+        _clock = clock;
+        _ticketLifetime = TimeSpan.FromHours(options.AuthenticationLifetimeHours);
+        _root = root;
     }
 
     /// <summary>SHA-256 of the Entra OID, folded into a 64-bit id. Stable across
@@ -83,13 +103,21 @@ public sealed class PersistentIdentity
             var dir = GetUserDir(record.Oid);
             Directory.CreateDirectory(dir);
             var path = Path.Combine(dir, "identity.json");
+            var existing = ReadRecord(record.Oid, useCache: false);
+            record.BrowserVersion = !string.IsNullOrEmpty(existing?.BrowserVersion)
+                ? existing.BrowserVersion : Guid.NewGuid().ToString("N");
+            record.RefreshToken ??= existing?.RefreshToken;
             var encrypted = _protector.Protect(JsonSerializer.Serialize(record));
             AtomicWrite(path, encrypted);
+            _recordCache.TryRemove(record.Oid, out _);
             _userIdToOid[record.UserId] = record.Oid;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to persist identity for oid={Oid}", record.Oid);
+            ctx.Session.Clear();
+            ctx.Response.Cookies.Delete(IdentityCookieName);
+            throw;
         }
         finally { sem.Release(); }
 
@@ -103,23 +131,24 @@ public sealed class PersistentIdentity
     /// account's identity on the next hydration.</summary>
     public void SetIdentityCookie(HttpContext ctx, string oid)
     {
-        try
+        var record = LoadByOid(oid);
+        if (record is null || string.IsNullOrEmpty(record.BrowserVersion))
+            throw new InvalidOperationException("Browser identity is unavailable.");
+        var previous = ReadTicket(ctx);
+        var now = _clock.GetUtcNow();
+        var ticket = previous is not null && Matches(previous, record)
+            ? previous : new BrowserTicket(record.Oid, record.TenantId, record.BrowserVersion, now, now.Add(_ticketLifetime));
+        var cookie = _ticketProtector.Protect(JsonSerializer.Serialize(ticket));
+        ctx.Response.Cookies.Append(IdentityCookieName, cookie, new CookieOptions
         {
-            var cookie = _protector.Protect(oid);
-            ctx.Response.Cookies.Append(IdentityCookieName, cookie, new CookieOptions
-            {
-                HttpOnly = true,
-                Secure = true,
-                SameSite = SameSiteMode.Lax,
-                IsEssential = true,
-                Expires = DateTimeOffset.UtcNow.Add(CookieLifetime),
-                Path = "/",
-            });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to set identity cookie");
-        }
+            HttpOnly = true,
+            Secure = true,
+            SameSite = SameSiteMode.Lax,
+            IsEssential = true,
+            Expires = ticket.ExpiresUtc,
+            Path = "/",
+        });
+        ctx.Session.SetString("browser_authenticated", "1");
     }
 
     /// <summary>Returns the persisted identity for the OID encoded in the
@@ -127,58 +156,106 @@ public sealed class PersistentIdentity
     /// file is missing.</summary>
     public IdentityRecord? Load(HttpContext ctx)
     {
-        if (!ctx.Request.Cookies.TryGetValue(IdentityCookieName, out var cookie) || string.IsNullOrEmpty(cookie))
-            return null;
-
-        string oid;
-        try { oid = _protector.Unprotect(cookie); }
-        catch
-        {
-            // Tampered or key-rotated cookie &#8212; clear it so the browser stops sending.
+        var ticket = ReadTicket(ctx);
+        var record = ticket is not null ? LoadByOid(ticket.Oid) : null;
+        if (ticket is not null && record is not null && Matches(ticket, record)) return record;
+        if (ctx.Request.Cookies.ContainsKey(IdentityCookieName))
             ctx.Response.Cookies.Delete(IdentityCookieName);
-            return null;
+        return null;
+    }
+
+    public bool RestoreSession(HttpContext ctx)
+    {
+        var record = Load(ctx);
+        if (record is null)
+        {
+            if (ctx.Session.GetString("azure_user") is not null || ctx.Session.GetString("browser_authenticated") == "1")
+            {
+                ctx.Session.Clear();
+                ctx.Items["finops.authenticationExpired"] = true;
+            }
+            return false;
         }
 
-        var path = Path.Combine(GetUserDir(oid), "identity.json");
-        if (!File.Exists(path)) return null;
+        if (ctx.Session.GetString("azure_user") is { } previousUser)
+        {
+            try
+            {
+                var previous = JsonSerializer.Deserialize<JsonElement>(previousUser);
+                if (previous.GetProperty("objectId").GetString() != record.Oid || previous.GetProperty("tenantId").GetString() != record.TenantId)
+                    ctx.Session.Clear();
+            }
+            catch (Exception exception) when (exception is JsonException or KeyNotFoundException or InvalidOperationException)
+            {
+                ctx.Session.Clear();
+            }
+        }
 
+        ctx.Session.SetString("user", JsonSerializer.Serialize(new
+        {
+            id = record.UserId, login = $"user-{record.UserId & 0xFFFF:X4}", name = record.Name,
+            avatar = (string?)null, email = record.Email
+        }));
+        ctx.Session.SetString("azure_user", JsonSerializer.Serialize(new
+        {
+            tenantId = record.TenantId, objectId = record.Oid, name = record.Name, email = record.Email
+        }));
+        ctx.Session.SetString("browser_authenticated", "1");
+        if (!string.IsNullOrEmpty(record.RefreshToken) && ctx.Session.GetString("azure_refresh_token") is null)
+            ctx.Session.SetString("azure_refresh_token", record.RefreshToken);
+        if (!string.IsNullOrEmpty(record.GraphTier) && ctx.Session.GetString("graph_tier") is null)
+            ctx.Session.SetString("graph_tier", record.GraphTier);
+        return true;
+    }
+
+    private sealed record BrowserTicket(string Oid, string TenantId, string Version, DateTimeOffset IssuedUtc, DateTimeOffset ExpiresUtc);
+
+    private BrowserTicket? ReadTicket(HttpContext ctx)
+    {
+        if (!ctx.Request.Cookies.TryGetValue(IdentityCookieName, out var cookie)) return null;
         try
         {
-            var encrypted = File.ReadAllText(path);
-            var json = _protector.Unprotect(encrypted);
-            var rec = JsonSerializer.Deserialize<IdentityRecord>(json);
-            if (rec is not null) _userIdToOid[rec.UserId] = rec.Oid;
-            return rec;
+            var ticket = JsonSerializer.Deserialize<BrowserTicket>(_ticketProtector.Unprotect(cookie));
+            var now = _clock.GetUtcNow();
+            return ticket is not null && Guid.TryParseExact(ticket.Oid, "D", out _)
+                && Guid.TryParseExact(ticket.TenantId, "D", out _) && !string.IsNullOrEmpty(ticket.Version)
+                && ticket.IssuedUtc <= now && ticket.ExpiresUtc > now && ticket.ExpiresUtc > ticket.IssuedUtc
+                && now - ticket.IssuedUtc < _ticketLifetime ? ticket : null;
         }
-        catch (CryptographicException ex)
-        {
-            // Same expected condition the cookie path above already swallows: the
-            // key rotated out of the ring (90-day default) or the record predates
-            // this deployment. Drop the cookie so the next request short-circuits
-            // instead of re-reading a permanently unreadable file, and log WITHOUT
-            // the exception object — passing it emits one AppExceptions row per
-            // request per user, which on a rotation trips the >10-in-15-min alert.
-            ctx.Response.Cookies.Delete(IdentityCookieName);
-            _logger.LogInformation(
-                "Identity record unreadable, re-auth required: {Reason}", ex.Message);
-            return null;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to load identity from {Path}", path);
-            return null;
-        }
+        catch (Exception exception) when (exception is CryptographicException or JsonException or FormatException) { return null; }
     }
+
+    private static bool Matches(BrowserTicket ticket, IdentityRecord record) =>
+        ticket.Oid == record.Oid && ticket.TenantId == record.TenantId && ticket.Version == record.BrowserVersion
+        && record.UserId == DeriveUserId(record.Oid);
 
     /// <summary>Clears the identity cookie and removes the on-disk file. Called
     /// from /auth/logout.</summary>
     public void Clear(HttpContext ctx, string? oid)
     {
+        var browserIdentity = oid is null ? Load(ctx) : null;
         ctx.Response.Cookies.Delete(IdentityCookieName);
-        if (!string.IsNullOrEmpty(oid))
+        var targetOid = oid ?? browserIdentity?.Oid;
+        if (!string.IsNullOrEmpty(targetOid))
         {
-            try { File.Delete(Path.Combine(GetUserDir(oid), "identity.json")); }
-            catch { }
+            var gate = LockFor(targetOid);
+            gate.Wait();
+            try
+            {
+                var path = Path.Combine(GetUserDir(targetOid), "identity.json");
+                if (oid is not null) File.Delete(path);
+                else
+                {
+                    var record = ReadRecord(targetOid, useCache: false);
+                    if (record is not null)
+                    {
+                        record.BrowserVersion = Guid.NewGuid().ToString("N");
+                        AtomicWrite(path, _protector.Protect(JsonSerializer.Serialize(record)));
+                    }
+                }
+                _recordCache.TryRemove(targetOid, out _);
+            }
+            finally { gate.Release(); }
         }
     }
 
@@ -193,7 +270,7 @@ public sealed class PersistentIdentity
 
         // Cold path after restart: walk users/ until we find a match. Cheap —
         // O(active users) and only on cache misses.
-        var root = Path.Combine(CopilotHome, "users");
+        var root = Path.Combine(_root, "users");
         if (!Directory.Exists(root)) return null;
         foreach (var dir in Directory.EnumerateDirectories(root))
         {
@@ -206,22 +283,40 @@ public sealed class PersistentIdentity
 
     /// <summary>Loads an identity by Entra OID directly (no cookie / context
     /// required). Returns null if the file is missing or undecryptable.</summary>
-    public IdentityRecord? LoadByOid(string oid)
+    public IdentityRecord? LoadByOid(string oid) => ReadRecord(oid, useCache: true);
+
+    private IdentityRecord? ReadRecord(string oid, bool useCache)
     {
+        if (!Guid.TryParseExact(oid, "D", out _)) return null;
+        var now = _clock.GetUtcNow();
+        if (useCache && _recordCache.TryGetValue(oid, out var cached) && cached.Expires > now)
+            return Deserialize(cached.Json);
         var path = Path.Combine(GetUserDir(oid), "identity.json");
-        if (!File.Exists(path)) return null;
+        if (!File.Exists(path))
+        {
+            _recordCache.TryRemove(oid, out _);
+            return null;
+        }
         try
         {
-            var encrypted = File.ReadAllText(path);
-            var json = _protector.Unprotect(encrypted);
-            var rec = JsonSerializer.Deserialize<IdentityRecord>(json);
-            if (rec is not null) _userIdToOid[rec.UserId] = rec.Oid;
-            return rec;
+            var json = _protector.Unprotect(File.ReadAllText(path));
+            if (_recordCache.Count > 1000)
+                foreach (var stale in _recordCache.Where(entry => entry.Value.Expires <= now).Select(entry => entry.Key).ToArray())
+                    _recordCache.TryRemove(stale, out _);
+            _recordCache[oid] = (json, now.Add(RecordCacheTtl));
+            return Deserialize(json);
         }
         catch
         {
             return null;
         }
+    }
+
+    private static IdentityRecord? Deserialize(string json)
+    {
+        var record = JsonSerializer.Deserialize<IdentityRecord>(json);
+        if (record is not null) _userIdToOid[record.UserId] = record.Oid;
+        return record;
     }
 
     /// <summary>Updates only the refresh token + recorded scopes on an existing
@@ -248,11 +343,12 @@ public sealed class PersistentIdentity
         await sem.WaitAsync();
         try
         {
-            var existing = JsonSerializer.Deserialize<IdentityRecord>(_protector.Unprotect(File.ReadAllText(path)));
+            var existing = ReadRecord(oid, useCache: false);
             if (existing is null) return;
             mutate(existing);
             existing.UpdatedUtc = DateTimeOffset.UtcNow;
             AtomicWrite(path, _protector.Protect(JsonSerializer.Serialize(existing)));
+            _recordCache.TryRemove(oid, out _);
             _userIdToOid[existing.UserId] = existing.Oid;
         }
         catch (CryptographicException ex)
@@ -270,15 +366,29 @@ public sealed class PersistentIdentity
 
     /// <summary>Crash-safe write: stage to a sibling .tmp then atomically replace
     /// the target. A torn write can leave the .tmp behind but never corrupts the
-    /// live identity.json &#8212; users keep their refresh token across restarts.</summary>
+    /// live identity.json &#8212; users keep their refresh token across restarts.
+    /// Retries briefly because /home is a network mount and a transient failure
+    /// would otherwise fail the sign-in outright.</summary>
     private static void AtomicWrite(string path, string contents)
     {
         var tmp = path + ".tmp";
-        File.WriteAllText(tmp, contents);
-        File.Move(tmp, path, overwrite: true);
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                File.WriteAllText(tmp, contents);
+                File.Move(tmp, path, overwrite: true);
+                return;
+            }
+            catch (IOException) when (attempt < 3)
+            {
+                Thread.Sleep(50 * attempt);
+            }
+        }
     }
 
-    private static string GetUserDir(string oid) => Path.Combine(CopilotHome, "users", oid);
+    private string GetUserDir(string oid) => Guid.TryParseExact(oid, "D", out _)
+        ? Path.Combine(_root, "users", oid) : throw new InvalidOperationException("Invalid identity.");
 }
 
 /// <summary>Encrypted-on-disk identity record. Contains only the long-lived
@@ -292,6 +402,7 @@ public sealed class IdentityRecord
     public string? Name { get; set; }
     public string? Email { get; set; }
     public string? RefreshToken { get; set; }
+    public string BrowserVersion { get; set; } = "";
     /// <summary>Comma-separated list of consented Graph tiers (e.g. "licenses,chargeback").</summary>
     public string? GraphTier { get; set; }
     public DateTimeOffset CreatedUtc { get; set; } = DateTimeOffset.UtcNow;

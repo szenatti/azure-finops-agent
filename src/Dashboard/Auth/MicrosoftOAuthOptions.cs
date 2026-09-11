@@ -17,6 +17,7 @@ public sealed class MicrosoftOAuthOptions
     public string ClientSecret { get; init; } = "";
     public string TenantId { get; init; } = "common";
     public string HomeTenantId { get; init; } = "common";
+    public int AuthenticationLifetimeHours { get; init; } = 8;
 
     public bool IsConfigured => !string.IsNullOrEmpty(ClientId);
 

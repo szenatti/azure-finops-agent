@@ -31,7 +31,8 @@ public sealed class IdTokenValidator
         string? Email,
         string? PreferredUsername);
 
-    public async Task<ValidatedClaims?> ValidateAsync(string idToken, string expectedNonce, CancellationToken ct = default)
+    public async Task<ValidatedClaims?> ValidateAsync(string idToken, string expectedNonce, CancellationToken ct = default,
+        DateTimeOffset? authenticationNotBefore = null)
     {
         // Peek tenant id from unverified token to choose the correct OIDC metadata document.
         // Signature is still validated below — peeking only selects which JWKS to verify against.
@@ -95,6 +96,12 @@ public sealed class IdTokenValidator
         }
 
         var claims = result.Claims;
+        if (authenticationNotBefore is { } started
+            && !IsFreshAuthentication(claims.TryGetValue("auth_time", out var authTime) ? authTime : null, started, DateTimeOffset.UtcNow))
+        {
+            _logger.LogWarning("id_token does not confirm fresh authentication");
+            return null;
+        }
         var nonce = claims.TryGetValue("nonce", out var nObj) ? nObj?.ToString() : null;
         if (!string.Equals(nonce, expectedNonce, StringComparison.Ordinal))
         {
@@ -118,4 +125,10 @@ public sealed class IdTokenValidator
             Email: claims.TryGetValue("email", out var e) ? e?.ToString() : null,
             PreferredUsername: claims.TryGetValue("preferred_username", out var p) ? p?.ToString() : null);
     }
+
+    internal static bool IsFreshAuthentication(object? authTime, DateTimeOffset requestedAt, DateTimeOffset now) =>
+        now >= requestedAt && now - requestedAt <= TimeSpan.FromMinutes(15)
+        && long.TryParse(Convert.ToString(authTime, System.Globalization.CultureInfo.InvariantCulture),
+            System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var seconds)
+        && seconds >= requestedAt.ToUnixTimeSeconds() - 60 && seconds <= now.ToUnixTimeSeconds() + 60;
 }

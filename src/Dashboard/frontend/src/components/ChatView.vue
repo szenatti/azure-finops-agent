@@ -2746,7 +2746,7 @@ async function uploadFiles(files) {
       const fd = new FormData();
       fd.append("file", file, file.name);
       const res = await fetch("/api/upload", { method: "POST", body: fd });
-      if (!res.ok) throw new Error(`upload failed (${res.status})`);
+      if (!res.ok) throw await requestRejection(res);
       const data = await res.json();
       const result = data.files?.[0];
       if (!result?.ok) throw new Error(result?.error || "upload rejected");
@@ -4625,6 +4625,23 @@ function tenantNameFor(tenantId) {
   if (!tenantId) return "";
   const t = availableTenants.value.find((x) => x.tenantId === tenantId);
   return t ? t.displayName || t.defaultDomain || "" : "";
+}
+
+async function requestRejection(response) {
+  const detail = await response.json().catch(() => ({}));
+  const retry = Number(response.headers.get("Retry-After"));
+  const message = detail.error || `Request failed (${response.status}).`;
+  const error = new Error(
+    message + (response.status === 429 && Number.isFinite(retry) && retry > 0
+      ? ` Try again in ${Math.ceil(retry)} seconds.` : ""),
+  );
+  error.requestRejected = true;
+  error.status = response.status;
+  if (response.status === 401) {
+    azureConnected.value = false;
+    azureUserEmail.value = "";
+  }
+  return error;
 }
 
 async function checkAzureStatus() {
@@ -7478,6 +7495,7 @@ async function send() {
       signal: streamAbortController.signal,
     });
 
+    if (!res.ok) throw await requestRejection(res);
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
@@ -8080,7 +8098,26 @@ async function send() {
     streamState.reconcileAbort = false;
     const abortReason = streamState.abortReason;
     const pendingStopRequest = streamState.stopRequest;
-    if (
+    if (err.requestRejected) {
+      if (isActiveView()) {
+        // The turn never started, so the optimistic bubble would duplicate on retry.
+        for (let i = messages.value.length - 1; i >= 0; i--) {
+          const m = messages.value[i];
+          if (m.role === "user" && m.content === prompt) {
+            messages.value.splice(i, 1);
+            break;
+          }
+        }
+        if (!input.value) input.value = prompt;
+        if (err.status !== 401) {
+          for (const image of consumedImages) {
+            if (!attachments.value.some((attachment) => attachment.uid === image.uid))
+              attachments.value.push({ ...image, thumbUrl: null });
+          }
+        }
+        setNotice("error", err.message);
+      }
+    } else if (
       err.name === "AbortError" &&
       abortReason === "stop" &&
       !watchdogFired &&

@@ -43,7 +43,7 @@ The agent is read-only. It analyses and drafts changes, but it cannot create, up
 - `POST` is refused by default and re-enabled only by callers that pass `allowReadOnlyPost` and then validate the path against the read-only allowlist in `AzureQueryTools`; action endpoints such as start, restart, deallocate, power-off, and reservation return are blocked.
 - Writes are refused before any HTTP request is issued, so a Contributor/Owner user's delegated token cannot be used to change the estate. The signed-in user's RBAC is a second boundary, not the only one.
 - Remediations must be delivered through `GenerateScript` so the user reviews and runs them.
-- The Copilot CLI shell built-ins (`bash`, `powershell`, `rg`) remain enabled for in-container data processing; they are not covered by the HTTP guard, so treat container egress and the app's own managed identity as the residual write channel.
+- The Copilot client uses `CopilotClientMode.Empty`. New/resumed sessions allow exact registered host-tool names and a restricted SDK isolated built-in set; shell, arbitrary filesystem, built-in network and unknown permissions are denied. Only registered custom-tool permissions may be approved. Never reintroduce `ApproveAll`, ambient extensions or shell fallbacks. Typed file inspection is host-controlled, not model-authored code execution.
 - Every session, job, upload, generated artifact, and transcript endpoint must enforce per-user ownership.
 - Ownership of a session is established by comparing its recorded working directory to the caller's own. A filter passed to an SDK list call is a query hint, never the boundary: verify what comes back, drop entries with no recorded directory, and never adopt or resume a session that has not passed that check.
 - Standard add-on consent tiers are read-only, and Graph writes are blocked in code regardless of consented scopes.
@@ -74,11 +74,13 @@ OAuth tiers are resource-specific and delegated:
 
 `tier=all` walks only the remaining add-on tiers through separate user-scoped consent screens. Do not combine cross-resource scopes or replace this with tenant-wide admin consent.
 
+Browser tickets use a separate `FinOps.BrowserTicket.v2` protector, signed issue/expiry timestamps and a random identity-record version. Validate on EVERY request, not only hydration. `Security:AuthenticationLifetimeHours` defaults to 8 (1-168). The decrypted record is cached in memory for 15 seconds because `/home` is a network share, so revocation lands within that window; writes invalidate it and the cache stores text, never shared record objects. Token refresh/add-on consent must not extend a valid browser ticket. Legacy cookies need one re-login. An expired browser cannot restore an Entra user from its ASP.NET session alone; fresh OAuth requests must request and verify recent `auth_time` across every tier. Background credentials and history remain separate from browser expiry.
+
 Disconnect/revoke/logout differ intentionally:
 
-- Disconnect clears live/session tokens and the browser identity cookie, but retains the encrypted identity record for explicit reconnect.
+- Disconnect clears live/session tokens and rotates the persisted browser authorization version, but retains the encrypted refresh-token record for scheduled jobs and explicit reconnect.
 - Revoke clears the cookie and encrypted identity record and forces fresh consent next time.
-- Logout clears Entra identity and immediately assigns a new anonymous chat identity.
+- Logout clears Entra identity and removes its persisted record; the next request can receive a new quota-limited anonymous identity. Revoked cookies must never become valid again when the record is recreated.
 
 Before manually testing a fresh consent flow, revoke existing grants for the test app in the selected test tenant. Use placeholders or local configuration—never commit real values.
 
@@ -154,12 +156,14 @@ Use `GetCrawlMaturityEvidence` exactly once for explicit Crawl scoring.
 - Generated script/deck markers are converted into structured SSE events.
 - A file is downloadable only when an artifact tool registers it: `GenerateScript` and `GenerateDocument` (`__SCRIPT_READY__`), `GenerateHtmlPresentation` and `GenerateMaturityReport` (`__HTML_READY__`). Files written by the shell built-ins are unreachable, and `sandbox:`/`file:`/absolute-path links are always broken and leak the per-user working directory. Keep this stated in the system prompt.
 - `GenerateDocument` reuses `ScriptTools.GeneratedFiles`, the script marker and `/api/download/script/{id}`, so ownership, replay, expiry and cleanup are shared. Its marker is one colon-delimited line: filenames are sanitized and descriptions stripped of newlines and colons so the SSE parser cannot be corrupted.
-- Download endpoints require an authenticated session and owner match.
+- Every artifact producer requires a host-bound owner before writing. `TryGetOwnedFile` is the only delivery lookup for downloads, live SSE and transcript reconstruction: exact non-null owner, existing file and 30-minute expiry are mandatory. Reject markers from unrelated tools; never use a global registry lookup to populate another user's content.
 - Expired artifacts render an expired state rather than a dead link.
 - Chart.js 4.4.0 is vendored at `src/Dashboard/AI/Tools/Assets/chart.umd.min.js` (MIT, banner retained) and embedded in the assembly, so a downloaded deck renders offline. Keep it inlined, keep the licence banner, and update the pinned version in one place. Google Fonts stays remote and degrades to a system font.
 - Every deck layout must wrap its body in `.content`. `.slide` is a flex row, so an unwrapped layout renders its children side by side. Use `data-idx`, not `data-i`.
 
 ## Scheduled jobs
+
+- `WorkloadQuota` shares concurrency and hourly turn limits with chat. Quota rejection reschedules a job as `quota_limited` without consuming a failure strike. Browser-ticket expiry does not remove its background refresh credential.
 
 - Jobs are Entra-only and use delegated refresh tokens.
 - Ownership is exact OID match; never fall back to a derived user-ID match.
@@ -178,6 +182,7 @@ Use `GetCrawlMaturityEvidence` exactly once for explicit Crawl scoring.
 - Do not rewrite punctuation in streamed model text. Identifiers such as hostnames, versions, and Azure resource names must remain byte-for-byte intact.
 - Escape all model/tool-influenced text before `v-html` transformations.
 - Only the explicit Stop action marks a response as stopped; an arbitrary `AbortError` is recoverable transport failure.
+- Check HTTP success before parsing SSE. Admission 401/413/429 responses are not severed streams: display the error and Retry-After, retain the unsent prompt, and do not start transcript-recovery polling for rejected work.
 - Attachment callbacks must update chips by stable `uid`, never by array index. Wait for uploads before sending, delist files whose chips were removed in flight, and revoke blob thumbnail URLs only after Vue unmounts them.
 - Generated HTML previews must stay in a sandboxed iframe without `allow-same-origin`; model-produced deck scripts must never inherit access to application cookies, storage, DOM, or authenticated APIs.
 
@@ -191,7 +196,14 @@ Use `GetCrawlMaturityEvidence` exactly once for explicit Crawl scoring.
 - Keep unrelated formatting out of functional changes.
 - Update `CHANGELOG.md` and this file whenever architecture, tools, security boundaries, dependencies, or project structure change.
 
-## Local development
+## Security Limits
+
+- Public fetching uses `PublicWebClient`: HTTPS/443 DNS destinations, no credentials/cookies/proxy, at most five manually validated redirects, public-IP-only connections pinned to the validated DNS result, 600KB body cap and a 20-second complete-read deadline. Private/reserved/metadata networks and IP literals are forbidden. Do not replace its handler with the general HTTP client or enable automatic redirects.
+- `Security:Workloads` configures positive request, turn, prompt and upload limits; defaults and rollout gates are in `docs/security-hardening.md`. Bucket anonymous callers by their browser session and bound total exposure with the `GlobalAnonymous*` ceilings. Never bucket by client IP: `X-Forwarded-For` is untrusted here, and the App Service transport peer is shared by every visitor, which collapses the whole demo into one bucket.
+- Reserve upload capacity before copying; retain the reservation for delisted files until physical deletion/TTL cleanup. Bound multipart buffering and Python worker concurrency. The embedded inspector has a 30-second deadline and Linux memory/CPU limits; never execute model-authored Python.
+- Limits and identity write locks are process-local. Do not claim distributed enforcement: use one application instance until an external admission limiter and shared identity coordination are in place. No quotas replace least-privileged managed identity, egress controls or final image scanning.
+
+## Local Development Commands
 
 Secrets use .NET User Secrets; never commit local settings.
 

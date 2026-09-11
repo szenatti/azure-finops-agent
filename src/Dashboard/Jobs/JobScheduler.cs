@@ -1,6 +1,7 @@
 using AzureFinOps.Dashboard.AI;
 using AzureFinOps.Dashboard.Auth;
 using AzureFinOps.Dashboard.Observability;
+using AzureFinOps.Dashboard.Infrastructure;
 using GitHub.Copilot;
 
 namespace AzureFinOps.Dashboard.Jobs;
@@ -41,6 +42,7 @@ public sealed class JobScheduler : BackgroundService
     private readonly PersistentIdentity _identity;
     private readonly IHttpClientFactory _httpFactory;
     private readonly ILogger<JobScheduler> _logger;
+    private readonly WorkloadQuota _workloadQuota;
 
     public JobScheduler(
         JobStore store,
@@ -49,7 +51,8 @@ public sealed class JobScheduler : BackgroundService
         SessionTokenStore tokenStore,
         PersistentIdentity identity,
         IHttpClientFactory httpFactory,
-        ILogger<JobScheduler> logger)
+        ILogger<JobScheduler> logger,
+        WorkloadQuota? workloadQuota = null)
     {
         _store = store;
         _telemetry = telemetry;
@@ -58,6 +61,7 @@ public sealed class JobScheduler : BackgroundService
         _identity = identity;
         _httpFactory = httpFactory;
         _logger = logger;
+        _workloadQuota = workloadQuota ?? WorkloadQuota.Default;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -143,6 +147,16 @@ public sealed class JobScheduler : BackgroundService
         if (record is null || string.IsNullOrEmpty(record.RefreshToken))
         {
             MarkFailure(job, "auth_expired", "No stored Azure connection — reconnect Azure to resume this job.");
+            return;
+        }
+
+        using var turnQuota = _workloadQuota.TryStartTurn(job.UserId, true, out var retryAfterSeconds);
+        if (turnQuota is null)
+        {
+            job.LastStatus = "quota_limited";
+            job.LastSummary = "Workload limit reached; the run has been rescheduled.";
+            job.NextRunUtc = DateTimeOffset.UtcNow.AddSeconds(Math.Max(60, retryAfterSeconds));
+            _store.Save();
             return;
         }
 

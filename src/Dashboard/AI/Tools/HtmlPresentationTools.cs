@@ -21,6 +21,20 @@ public static class HtmlPresentationTools
     // Baggage — the download endpoint rejects other users' sessions.
     internal static readonly ConcurrentDictionary<string, (string Path, DateTime Created, long? Owner)> GeneratedFiles = new();
 
+    internal static bool TryGetOwnedFile(string fileId, long? userId,
+      out (string Path, DateTime Created, long? Owner) entry)
+    {
+      if (userId.HasValue && GeneratedFiles.TryGetValue(fileId, out var candidate)
+        && candidate.Owner == userId && candidate.Created > DateTime.UtcNow.AddMinutes(-30)
+        && File.Exists(candidate.Path))
+      {
+        entry = candidate;
+        return true;
+      }
+      entry = default;
+      return false;
+    }
+
     internal static void CleanupOldFiles() =>
         TempFileHelper.CleanupOldFiles(GeneratedFiles, v => v.Created, v => v.Path);
 
@@ -75,6 +89,8 @@ EXAMPLE:
         [Description("Filename (without extension). Default: 'FinOps-Deck'.")] string? filename,
         [Description("Optional customer/tenant name shown on the title slide and in chrome.")] string? customer = null)
     {
+      var owner = HttpHelper.CurrentTurnUserId();
+      if (!owner.HasValue) return Task.FromResult("Error: Artifact owner is unavailable.");
         if (string.IsNullOrWhiteSpace(slidesJson))
             return Task.FromResult("Error: No slides data provided.");
 
@@ -109,7 +125,7 @@ EXAMPLE:
         var html = BuildShell(deckTitle, slidesHtml.ToString(), chartScripts.ToString());
         File.WriteAllText(outputPath, html, new UTF8Encoding(false));
 
-        GeneratedFiles[fileId] = (outputPath, DateTime.UtcNow, HttpHelper.CurrentTurnUserId());
+        GeneratedFiles[fileId] = (outputPath, DateTime.UtcNow, owner);
         return Task.FromResult($"__HTML_READY__:{fileId}:{safeName}.html:{slideCount}");
     }
 

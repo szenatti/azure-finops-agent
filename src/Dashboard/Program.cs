@@ -22,6 +22,7 @@ var oauthOptions = new MicrosoftOAuthOptions
     HomeTenantId = builder.Configuration["Microsoft:HomeTenantId"]
                    ?? builder.Configuration["Microsoft:TenantId"]
                    ?? "common",
+    AuthenticationLifetimeHours = builder.Configuration.GetValue("Security:AuthenticationLifetimeHours", 8),
 };
 var azureOpenAIEndpoint = builder.Configuration["AzureOpenAI:Endpoint"];
 if (string.IsNullOrWhiteSpace(azureOpenAIEndpoint))
@@ -115,10 +116,13 @@ builder.Services.AddSingleton<EntraClientCredentials>();
 builder.Services.AddSingleton<IdTokenValidator>();
 builder.Services.AddSingleton<SessionTokenStore>();
 builder.Services.AddSingleton<PersistentIdentity>();
+builder.Services.AddSingleton(new AzureFinOps.Dashboard.Infrastructure.WorkloadQuota(
+    builder.Configuration.GetSection("Security:Workloads").Get<AzureFinOps.Dashboard.Infrastructure.WorkloadOptions>() ?? new()));
 // Janitor is started manually after CopilotSessionFactory is constructed
 // (see below) because it now depends on the factory for the 30-day TTL sweep.
 
 var app = builder.Build();
+var workloadQuota = app.Services.GetRequiredService<AzureFinOps.Dashboard.Infrastructure.WorkloadQuota>();
 var loggerFactory = app.Services.GetRequiredService<ILoggerFactory>();
 var logger = loggerFactory.CreateLogger("AzureFinOps.AI");
 logger.LogInformation("Application starting. AppInsights configured: {Configured}", !string.IsNullOrEmpty(appInsightsCs));
@@ -168,7 +172,7 @@ var jobScheduler = new AzureFinOps.Dashboard.Jobs.JobScheduler(
     app.Services.GetRequiredService<SessionTokenStore>(),
     app.Services.GetRequiredService<PersistentIdentity>(),
     app.Services.GetRequiredService<IHttpClientFactory>(),
-    loggerFactory.CreateLogger<AzureFinOps.Dashboard.Jobs.JobScheduler>());
+    loggerFactory.CreateLogger<AzureFinOps.Dashboard.Jobs.JobScheduler>(), workloadQuota);
 await jobScheduler.StartAsync(CancellationToken.None);
 app.Lifetime.ApplicationStopping.Register(() =>
 {
@@ -314,25 +318,6 @@ app.UseStaticFiles(new StaticFileOptions
     }
 });
 
-// Absolute session lifetime — even if the user is active, force re-auth after 8h.
-// Limits the blast radius of a stolen session cookie.
-const int AbsoluteSessionMaxHours = 8;
-app.Use(async (ctx, next) =>
-{
-    var startStr = ctx.Session.GetString("session_started_utc");
-    if (startStr is null)
-    {
-        ctx.Session.SetString("session_started_utc", DateTimeOffset.UtcNow.ToString("o"));
-    }
-    else if (DateTimeOffset.TryParse(startStr, out var started)
-             && DateTimeOffset.UtcNow - started > TimeSpan.FromHours(AbsoluteSessionMaxHours))
-    {
-        ctx.Session.Clear();
-        ctx.Session.SetString("session_started_utc", DateTimeOffset.UtcNow.ToString("o"));
-    }
-    await next();
-});
-
 // CSRF defense — for state-changing requests, require Origin/Referer to match this host.
 // Combined with SameSite=Lax cookies this defeats the standard CSRF surface.
 app.Use(async (ctx, next) =>
@@ -365,70 +350,35 @@ app.Use(async (ctx, next) =>
 var persistentIdentity = app.Services.GetRequiredService<PersistentIdentity>();
 app.Use(async (ctx, next) =>
 {
-    var hasUser = ctx.Session.GetString("user") is not null;
-    var hasAzureUser = ctx.Session.GetString("azure_user") is not null;
-    if (!hasUser || !hasAzureUser)
+    persistentIdentity.RestoreSession(ctx);
+    if (ctx.Items.ContainsKey("finops.authenticationExpired") && ctx.Request.Path.StartsWithSegments("/api"))
     {
-        var record = persistentIdentity.Load(ctx);
-        if (record is not null && !string.IsNullOrEmpty(record.Oid))
+        ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        await ctx.Response.WriteAsJsonAsync(new { error = "Your sign-in expired. Connect Azure again to continue.", code = "authentication_expired" });
+        return;
+    }
+    if (ctx.Session.GetString("user") is null)
+    {
+        var sessionUserId = (long)(RandomNumberGenerator.GetInt32(1_000_000, int.MaxValue)) << 24
+                             | (long)RandomNumberGenerator.GetInt32(0, 1 << 24);
+        ctx.Session.SetString("user", JsonSerializer.Serialize(new
         {
-            // Returning Entra user: rebuild the session blobs deterministically.
-            // We rehydrate `azure_user` even when `user` is already set so the
-            // sidebar always shows the signed-in email after a backend restart
-            // (the in-memory session middleware loses azure_user across
-            // process boundaries; the persistent identity cookie survives).
-            if (!hasUser)
-            {
-                ctx.Session.SetString("user", JsonSerializer.Serialize(new
-                {
-                    id = record.UserId,
-                    login = $"user-{record.UserId & 0xFFFF:X4}",
-                    name = record.Name,
-                    avatar = (string?)null,
-                    email = record.Email,
-                }));
-            }
-            if (!hasAzureUser)
-            {
-                ctx.Session.SetString("azure_user", JsonSerializer.Serialize(new Dictionary<string, string?>
-                {
-                    ["tenantId"] = record.TenantId,
-                    ["objectId"] = record.Oid,
-                    ["name"] = record.Name,
-                    ["email"] = record.Email,
-                }));
-            }
-            if (!string.IsNullOrEmpty(record.RefreshToken) && ctx.Session.GetString("azure_refresh_token") is null)
-                ctx.Session.SetString("azure_refresh_token", record.RefreshToken);
-            if (!string.IsNullOrEmpty(record.GraphTier) && ctx.Session.GetString("graph_tier") is null)
-                ctx.Session.SetString("graph_tier", record.GraphTier);
-        }
-        else if (!hasUser)
-        {
-            // Brand-new visitor: crypto-random anonymous id keyed only in this session.
-            var sessionUserId = (long)(RandomNumberGenerator.GetInt32(1_000_000, int.MaxValue)) << 24
-                                 | (long)RandomNumberGenerator.GetInt32(0, 1 << 24);
-            ctx.Session.SetString("user", JsonSerializer.Serialize(new
-            {
-                id = sessionUserId,
-                login = $"user-{sessionUserId % 10000:D4}",
-                name = (string?)null,
-                avatar = (string?)null,
-                email = (string?)null
-            }));
-        }
+            id = sessionUserId, login = $"user-{sessionUserId % 10000:D4}", name = (string?)null,
+            avatar = (string?)null, email = (string?)null
+        }));
     }
     await next();
 });
 
 // ── Endpoints ──────────────────────────────────────────────────
+app.Use((ctx, next) => workloadQuota.GuardRequestAsync(ctx, () => next()));
 var tokenStore = app.Services.GetRequiredService<SessionTokenStore>();
 var entraCredentials = app.Services.GetRequiredService<EntraClientCredentials>();
 var idTokenValidator = app.Services.GetRequiredService<IdTokenValidator>();
 
 app.MapMicrosoftAuthEndpoints(oauthOptions, entraCredentials, idTokenValidator, telemetry, persistentIdentity, logger);
 app.MapAzureSessionEndpoints(tokenStore, telemetry, persistentIdentity, logger);
-app.MapChatEndpoints(copilotFactory, tokenStore, telemetry, logger);
+app.MapChatEndpoints(copilotFactory, tokenStore, telemetry, logger, workloadQuota);
 app.MapSessionEndpoints(copilotFactory, telemetry, jobStore, logger);
 AzureFinOps.Dashboard.Jobs.JobEndpoints.MapJobEndpoints(app, jobStore, jobScheduler, logger);
 app.MapMetaEndpoints(appInsightsCs ?? "", azureOpenAIDeployment);

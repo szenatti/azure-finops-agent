@@ -16,11 +16,7 @@ namespace AzureFinOps.Dashboard.AI.Tools;
 /// </summary>
 public static class WebFetchTools
 {
-    private static readonly HttpClient Http = new()
-    {
-        Timeout = TimeSpan.FromSeconds(20),
-        DefaultRequestVersion = HttpVersion.Version20,
-    };
+    private static readonly HttpClient Http = PublicWebClient.CreateClient();
 
     private const int MaxBytes = 600_000;       // ~600KB hard cap on the wire
     private const int MaxOutputChars = 60_000;  // ~60KB returned to the LLM after stripping
@@ -49,16 +45,17 @@ Common patterns:
 
 Returns: HTTP status, final URL (after redirects), content-type, and the body. HTML is stripped to plain text (script/style/nav removed); JSON / XML / plain text are returned as-is. Capped at ~60KB after stripping — if truncated, refine with a deeper / more specific URL or a fragment.
 
-Limits: HTTPS only. GET only. No cookies, no auth headers. Per-request cap ~600KB on the wire. 20s timeout.");
+Limits: Public HTTPS on port 443 only. GET only. No cookies, auth headers, proxies, private destinations or IP-literal URLs. Up to five validated redirects. Per-request cap ~600KB on the wire. 20s timeout including body reads.");
     }
 
     private static async Task<string> FetchPublicWebPage(
         [Description("Full HTTPS URL to fetch. Must start with https://. No query-string secrets.")] string url,
         [Description("Optional substring to grep for in the body — only lines containing this substring are returned. Useful for SKU names, model names, line items on long pricing pages. Empty = return everything (truncated).")] string? grepFor = null,
-        [Description("Max characters returned after stripping (default 60000, max 200000). Lower = faster.")] int maxChars = 60_000)
+        [Description("Max characters returned after stripping (default 60000, max 200000). Lower = faster.")] int maxChars = 60_000,
+        CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(url) || !Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps)
-            return "Error: url must be a valid absolute https:// URL.";
+        if (string.IsNullOrWhiteSpace(url) || !Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri) || !PublicWebClient.IsAllowedUri(uri))
+            return "Error: a public HTTPS destination on port 443 is required.";
 
         maxChars = Math.Clamp(maxChars, 1_000, 200_000);
 
@@ -67,34 +64,26 @@ Limits: HTTPS only. GET only. No cookies, no auth headers. Per-request cap ~600K
         activity?.SetTag("fetch.path", uri.AbsolutePath);
         activity?.SetTag("fetch.has_grep", !string.IsNullOrWhiteSpace(grepFor));
 
-        HttpResponseMessage res;
+        PublicWebClient.Page page;
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(TimeSpan.FromSeconds(20));
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Get, uri);
-            res = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
+            page = await PublicWebClient.ReadAsync(Http, uri, deadline.Token);
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception ex) when (ex is HttpRequestException or IOException or OperationCanceledException)
         {
             activity?.SetTag("fetch.error", ex.GetType().Name);
-            return $"Error: fetch failed ({ex.GetType().Name}: {ex.Message}). URL={uri}. Try a different URL or escalate to another source per the Persistence rule.";
+            return "Error: public web fetch was blocked, unavailable or timed out. Use another public source.";
         }
 
-        var contentType = res.Content.Headers.ContentType?.MediaType ?? "unknown";
-        activity?.SetTag("fetch.status_code", (int)res.StatusCode);
+        var contentType = page.ContentType;
+        activity?.SetTag("fetch.status_code", (int)page.Status);
         activity?.SetTag("fetch.content_type", contentType);
 
-        // Read up to MaxBytes only.
-        await using var stream = await res.Content.ReadAsStreamAsync();
-        using var ms = new MemoryStream();
-        var buffer = new byte[16_384];
-        var total = 0;
-        int read;
-        while (total < MaxBytes && (read = await stream.ReadAsync(buffer, 0, Math.Min(buffer.Length, MaxBytes - total))) > 0)
-        {
-            ms.Write(buffer, 0, read);
-            total += read;
-        }
-        var raw = Encoding.UTF8.GetString(ms.ToArray());
+        var total = page.Bytes;
+        var raw = page.Body;
         activity?.SetTag("fetch.bytes", total);
 
         var body = contentType.Contains("html", StringComparison.OrdinalIgnoreCase)
@@ -125,8 +114,8 @@ Limits: HTTPS only. GET only. No cookies, no auth headers. Per-request cap ~600K
         activity?.SetTag("fetch.truncated", truncated);
 
         var sb = new StringBuilder();
-        sb.AppendLine($"HTTP {(int)res.StatusCode} {res.StatusCode}");
-        sb.AppendLine($"Final URL: {res.RequestMessage?.RequestUri ?? uri}");
+        sb.AppendLine($"HTTP {(int)page.Status} {page.Status}");
+        sb.AppendLine($"Final URL: {page.Uri}");
         sb.AppendLine($"Content-Type: {contentType}");
         sb.AppendLine($"Bytes on wire: {total}{(total >= MaxBytes ? " (HARD CAP — refine URL)" : "")}");
         sb.AppendLine($"UTC: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}");

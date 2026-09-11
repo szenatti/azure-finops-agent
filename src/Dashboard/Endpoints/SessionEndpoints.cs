@@ -229,7 +229,7 @@ public static class SessionEndpoints
                                         }
                                     }
                                 }
-                                if (rt.Contains("__HTML_READY__:"))
+                                if (r.Name is "GenerateHtmlPresentation" or "GenerateMaturityReport" && rt.Contains("__HTML_READY__:"))
                                 {
                                     foreach (var line in rt.Split('\n'))
                                     {
@@ -246,13 +246,13 @@ public static class SessionEndpoints
                                                     // Artifacts live 30 min in-memory + on temp disk; after a
                                                     // TTL sweep or restart the download link is dead — let the
                                                     // UI render an \"expired\" state instead of a 404 link.
-                                                    expired = !AzureFinOps.Dashboard.AI.Tools.HtmlPresentationTools.GeneratedFiles.ContainsKey(parts[0]),
+                                                    expired = !AzureFinOps.Dashboard.AI.Tools.HtmlPresentationTools.TryGetOwnedFile(parts[0], userId, out _),
                                                 };
                                             break;
                                         }
                                     }
                                 }
-                                if (rt.Contains("__SCRIPT_READY__:"))
+                                if (r.Name is "GenerateScript" or "GenerateDocument" && rt.Contains("__SCRIPT_READY__:"))
                                 {
                                     foreach (var line in rt.Split('\n'))
                                     {
@@ -262,7 +262,7 @@ public static class SessionEndpoints
                                             var parts = t["__SCRIPT_READY__:".Length..].Split(':', 5);
                                             if (parts.Length >= 4)
                                             {
-                                                var live = AzureFinOps.Dashboard.AI.Tools.ScriptTools.GeneratedFiles.TryGetValue(parts[0], out var entry);
+                                                var live = AzureFinOps.Dashboard.AI.Tools.ScriptTools.TryGetOwnedFile(parts[0], userId, out var entry);
                                                 pendingScript = new
                                                 {
                                                     fileId = parts[0],

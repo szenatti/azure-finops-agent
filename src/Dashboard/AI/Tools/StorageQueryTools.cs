@@ -21,7 +21,7 @@ public class StorageQueryTools
     {
         yield return AIFunctionFactory.Create(ListCostExportBlobs, "ListCostExportBlobs", @"Lists blobs in an Azure Storage container to discover cost export files. Use before ReadCostExportBlob. Scheduled exports usually write `{exportName}/{YYYYMMDD-YYYYMMDD}/{file}.csv`. Returns blob names, sizes, last-modified.");
 
-        yield return AIFunctionFactory.Create(ReadCostExportBlob, "ReadCostExportBlob", @"Reads a CSV blob (FOCUS-format cost export) from Azure Storage. >1MB files: only first 500KB returned — for full analysis, use bash with `curl -H 'Authorization: Bearer {token}' '{blobUrl}' -o /tmp/export.csv` then a Python pandas script.
+        yield return AIFunctionFactory.Create(ReadCostExportBlob, "ReadCostExportBlob", @"Reads a CSV blob (FOCUS-format cost export) from Azure Storage. Only the first 500KB is returned. For larger exports, ask the user to upload a suitably sized file and use QueryUploadedFile. Never request tokens or use shell commands to fetch data.
 
 FOCUS columns: BilledCost, EffectiveCost, ServiceCategory, ServiceName, SubAccountName, ResourceId, Region, ChargeCategory, PricingModel, etc.");
     }

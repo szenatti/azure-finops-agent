@@ -31,6 +31,8 @@ public sealed class UploadedFileTools
 
     // userId → (fileId → entry)
     internal static readonly ConcurrentDictionary<long, ConcurrentDictionary<string, UploadEntry>> UserFiles = new();
+    private static readonly ConcurrentDictionary<string, (UploadEntry Entry, IDisposable Reservation)> StoredFiles = new();
+    private static readonly SemaphoreSlim InspectionGate = new(2, 2);
 
     private const int TimeoutSeconds = 30;
     private const long MaxBytes = 100L * 1024 * 1024; // 100 MB
@@ -101,7 +103,8 @@ Examples:
     private async Task<string> QueryUploadedFile(
         [Description("The fileId returned at upload time (12-char hex).")] string fileId,
         [Description("Operation: preview, schema, count, workbook, head, tail, slice, text_range, filter, aggregate, json_path.")] string mode,
-        [Description("Optional JSON object with mode-specific parameters (see tool description).")] string? paramsJson)
+        [Description("Optional JSON object with mode-specific parameters (see tool description).")] string? paramsJson,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(fileId)) return Json(new { ok = false, error = "fileId required" });
         if (string.IsNullOrWhiteSpace(mode)) return Json(new { ok = false, error = "mode required" });
@@ -136,14 +139,15 @@ Examples:
             }
         }
 
-        return await RunPythonAsync(JsonSerializer.Serialize(requestObj));
+        return await RunPythonAsync(JsonSerializer.Serialize(requestObj), cancellationToken);
     }
 
     // ---------------------------------------------------------------- Public API
 
     /// <summary>Persists an uploaded file and returns the entry plus an inline preview JSON for the chat context.</summary>
     public static async Task<(UploadEntry Entry, string PreviewJson)> RegisterAsync(
-        long userId, Stream content, string fileName, long? declaredSize = null)
+        long userId, Stream content, string fileName, long? declaredSize = null,
+        bool authenticated = false, WorkloadQuota? quotas = null, CancellationToken cancellationToken = default)
     {
         Cleanup();
 
@@ -154,60 +158,61 @@ Examples:
         var fileId = Guid.NewGuid().ToString("N")[..12];
         var safeName = TempFileHelper.SanitizeFilename(fileName, "upload" + ext);
         var path = Path.Combine(TempFileHelper.UploadRoot, $"{fileId}_{safeName}");
+        quotas ??= WorkloadQuota.Default;
+        var fileLimit = Math.Min(MaxBytes, (long)(authenticated ? quotas.Options.MaxUploadMegabytes : quotas.Options.AnonymousMaxUploadMegabytes) * 1024 * 1024);
+        var reservedBytes = declaredSize ?? fileLimit;
+        var reservation = quotas.TryReserveUpload(userId, authenticated, reservedBytes)
+            ?? throw new InvalidOperationException("Upload quota reached. Remove old files or wait for retained attachments to expire.");
 
-        await using (var fs = File.Create(path))
+        try
         {
-            // copy with hard size cap
-            var buffer = new byte[81920];
-            long total = 0;
-            int read;
-            while ((read = await content.ReadAsync(buffer)) > 0)
+            await using (var fs = File.Create(path))
             {
-                total += read;
-                if (total > MaxBytes)
+                var buffer = new byte[81920];
+                long total = 0;
+                int read;
+                while ((read = await content.ReadAsync(buffer, cancellationToken)) > 0)
                 {
-                    fs.Close();
-                    try { File.Delete(path); } catch { }
-                    throw new InvalidOperationException($"File exceeds {MaxBytes / 1024 / 1024} MB upload limit.");
+                    total += read;
+                    if (total > Math.Min(reservedBytes, fileLimit))
+                        throw new InvalidOperationException("File exceeds its reserved upload size.");
+                    await fs.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
                 }
-                await fs.WriteAsync(buffer.AsMemory(0, read));
             }
-        }
 
-        var size = new FileInfo(path).Length;
-        var kind = KindFromExt(ext);
+            var size = new FileInfo(path).Length;
+            var kind = KindFromExt(ext);
 
-        string previewJson;
-        string? schemaSummary;
-        if (kind == "image")
-        {
-            // Images bypass the Python helper entirely — they're attached to the
-            // model natively as vision content by ChatEndpoints. The preview is a
-            // synthetic stub so the upload response / chat context stay uniform.
-            if (size > MaxImageBytes)
+            string previewJson;
+            string? schemaSummary;
+            if (kind == "image")
             {
-                try { File.Delete(path); } catch { }
-                throw new InvalidOperationException($"Image exceeds {MaxImageBytes / 1024 / 1024} MB limit for vision input.");
+                if (size > MaxImageBytes)
+                    throw new InvalidOperationException($"Image exceeds {MaxImageBytes / 1024 / 1024} MB limit for vision input.");
+                previewJson = JsonSerializer.Serialize(new { ok = true, kind = "image", note = "Image attached — the assistant sees it directly." });
+                schemaSummary = $"image ({ext.TrimStart('.').ToLowerInvariant()}, {Math.Max(1, size / 1024)} KB) — attached to the model as a visual";
             }
-            previewJson = JsonSerializer.Serialize(new { ok = true, kind = "image", note = "Image attached — the assistant sees it directly." });
-            schemaSummary = $"image ({ext.TrimStart('.').ToLowerInvariant()}, {Math.Max(1, size / 1024)} KB) — attached to the model as a visual";
-        }
-        else
-        {
-            // Generate the preview synchronously (for the upload response)
-            var previewRequest = JsonSerializer.Serialize(new Dictionary<string, object?>
+            else
             {
-                ["mode"] = "preview",
-                ["path"] = path,
-                ["kind"] = kind,
-            });
-            previewJson = await RunPythonAsync(previewRequest);
-            schemaSummary = SummarizeSchema(kind, previewJson);
-        }
+                var previewRequest = JsonSerializer.Serialize(new Dictionary<string, object?>
+                {
+                    ["mode"] = "preview", ["path"] = path, ["kind"] = kind,
+                });
+                previewJson = await RunPythonAsync(previewRequest, cancellationToken);
+                schemaSummary = SummarizeSchema(kind, previewJson);
+            }
 
-        var entry = new UploadEntry(fileId, userId, fileName, kind, path, size, DateTime.UtcNow, schemaSummary);
-        UserFiles.GetOrAdd(userId, _ => new ConcurrentDictionary<string, UploadEntry>())[fileId] = entry;
-        return (entry, previewJson);
+            var entry = new UploadEntry(fileId, userId, fileName, kind, path, size, DateTime.UtcNow, schemaSummary);
+            StoredFiles[fileId] = (entry, reservation);
+            UserFiles.GetOrAdd(userId, _ => new ConcurrentDictionary<string, UploadEntry>())[fileId] = entry;
+            return (entry, previewJson);
+        }
+        catch
+        {
+            try { File.Delete(path); }
+            finally { reservation.Dispose(); }
+            throw;
+        }
     }
 
     /// <summary>Compact one-line schema for the LLM context (kept under ~300 chars).</summary>
@@ -279,9 +284,18 @@ Examples:
 
     public static void ClearForUser(long userId)
     {
-        if (!UserFiles.TryRemove(userId, out var bucket)) return;
-        foreach (var e in bucket.Values)
-            try { File.Delete(e.Path); } catch { }
+        UserFiles.TryRemove(userId, out _);
+        foreach (var stored in StoredFiles.Where(pair => pair.Value.Entry.UserId == userId))
+            DeleteStoredFile(stored.Key);
+    }
+
+    private static void DeleteStoredFile(string fileId)
+    {
+        if (!StoredFiles.TryGetValue(fileId, out var stored)) return;
+        try { File.Delete(stored.Entry.Path); }
+        catch (IOException) { return; }
+        catch (UnauthorizedAccessException) { return; }
+        if (StoredFiles.TryRemove(fileId, out var removed)) removed.Reservation.Dispose();
     }
 
     // ---------------------------------------------------------------- Internals
@@ -318,6 +332,11 @@ Examples:
     private static void Cleanup()
     {
         var cutoff = DateTime.UtcNow.AddMinutes(-30);
+        foreach (var stored in StoredFiles.Where(pair => pair.Value.Entry.CreatedUtc < cutoff))
+        {
+            if (UserFiles.TryGetValue(stored.Value.Entry.UserId, out var files)) files.TryRemove(stored.Key, out _);
+            DeleteStoredFile(stored.Key);
+        }
         foreach (var (uid, bucket) in UserFiles)
         {
             foreach (var (fid, entry) in bucket)
@@ -332,9 +351,36 @@ Examples:
         }
     }
 
-    private static async Task<string> RunPythonAsync(string requestJson)
+    private static async Task<string> RunPythonAsync(string requestJson, CancellationToken cancellationToken = default)
     {
-        var script = LoadEmbeddedScript("file_inspect.py");
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(TimeSpan.FromSeconds(TimeoutSeconds));
+        var entered = false;
+        try
+        {
+            await InspectionGate.WaitAsync(deadline.Token);
+            entered = true;
+            return await RunPythonCoreAsync(requestJson, deadline.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return Json(new { ok = false, error = "File inspection timed out or is busy. Try again later." });
+        }
+        finally { if (entered) InspectionGate.Release(); }
+    }
+
+    // RLIMIT_AS counts reserved address space, not resident memory, and pyarrow/numpy
+    // reserve far more than they touch — keep the cap well above a legitimate 100 MB
+    // workbook so it only stops runaway allocation. Validate against the built image.
+    private const long InspectionAddressSpaceBytes = 4L * 1024 * 1024 * 1024;
+    private const int InspectionCpuSeconds = 25;
+
+    private static async Task<string> RunPythonCoreAsync(string requestJson, CancellationToken cancellationToken)
+    {
+        var script = "import sys\nif sys.platform == 'linux':\n import resource\n"
+            + $" resource.setrlimit(resource.RLIMIT_AS, ({InspectionAddressSpaceBytes}, {InspectionAddressSpaceBytes}))\n"
+            + $" resource.setrlimit(resource.RLIMIT_CPU, ({InspectionCpuSeconds}, {InspectionCpuSeconds}))\n"
+            + "exec(compile(" + JsonSerializer.Serialize(LoadEmbeddedScript("file_inspect.py")) + ", '<file_inspect>', 'exec'))";
 
         var psi = new ProcessStartInfo
         {
@@ -351,6 +397,8 @@ Examples:
         // The helper refuses to open anything outside this root, and fails closed
         // when the variable is missing.
         psi.Environment["FINOPS_UPLOAD_ROOT"] = TempFileHelper.UploadRoot;
+        psi.Environment["OPENBLAS_NUM_THREADS"] = "1";
+        psi.Environment["OMP_NUM_THREADS"] = "1";
 
         var pipTarget = "/home/site/pip-packages";
         if (Directory.Exists(pipTarget))
@@ -362,26 +410,20 @@ Examples:
         using var process = new Process { StartInfo = psi };
         process.Start();
 
-        await process.StandardInput.WriteAsync(requestJson);
-        process.StandardInput.Close();
-
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderrTask = process.StandardError.ReadToEndAsync();
-
-        var exited = process.WaitForExit(TimeoutSeconds * 1000);
-        if (!exited)
+        try
         {
-            try { process.Kill(entireProcessTree: true); } catch { }
-            return Json(new { ok = false, error = $"file_inspect timed out after {TimeoutSeconds}s" });
+            await process.StandardInput.WriteAsync(requestJson.AsMemory(), cancellationToken);
+            process.StandardInput.Close();
+            var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+            var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+            await process.WaitForExitAsync(cancellationToken);
+            var stdout = await stdoutTask;
+            var stderr = await stderrTask;
+            if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(stdout))
+                return Json(new { ok = false, error = "File inspection failed or exceeded resource limits." });
+            return stdout.Trim();
         }
-
-        var stdout = await stdoutTask;
-        var stderr = await stderrTask;
-
-        if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(stdout))
-            return Json(new { ok = false, error = $"file_inspect exit={process.ExitCode}", stderr = Truncate(stderr, 1000) });
-
-        return stdout.Trim();
+        finally { if (!process.HasExited) { try { process.Kill(entireProcessTree: true); } catch { } } }
     }
 
     private static object? JsonValueToObject(JsonElement el) => el.ValueKind switch

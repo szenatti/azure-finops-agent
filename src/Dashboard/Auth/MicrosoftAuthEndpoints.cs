@@ -255,7 +255,8 @@ public static class MicrosoftAuthEndpoints
             var forceConsent = ctx.Session.GetString("force_consent") == "1";
             ctx.Session.Remove("force_consent");
             var silentChain = ctx.Session.GetString("auth_silent") == "1";
-            string promptType = silentChain ? "none"
+            var requireFreshLogin = persistentIdentity.Load(ctx) is null;
+            string promptType = requireFreshLogin ? "login" : silentChain ? "none"
                 : (tier != "base" || forceConsent) ? "consent"
                 : "select_account";
 
@@ -270,6 +271,13 @@ public static class MicrosoftAuthEndpoints
                       $"&prompt={promptType}" +
                       $"&code_challenge={codeChallenge}" +
                       $"&code_challenge_method=S256";
+
+            if (requireFreshLogin)
+            {
+                url += "&max_age=0";
+                ctx.Session.SetString("fresh_auth_started", DateTimeOffset.UtcNow.ToString("o"));
+            }
+            else ctx.Session.Remove("fresh_auth_started");
 
             if (promptType == "none")
             {
@@ -469,7 +477,10 @@ public static class MicrosoftAuthEndpoints
                     var idToken = idTokenProp.GetString()!;
                     var expectedNonce = ctx.Session.GetString("oidc_nonce") ?? "";
                     ctx.Session.Remove("oidc_nonce");
-                    var validated = await idTokenValidator.ValidateAsync(idToken, expectedNonce);
+                    DateTimeOffset? authenticationNotBefore = DateTimeOffset.TryParse(ctx.Session.GetString("fresh_auth_started"), out var freshAuthStarted)
+                        ? freshAuthStarted : null;
+                    ctx.Session.Remove("fresh_auth_started");
+                    var validated = await idTokenValidator.ValidateAsync(idToken, expectedNonce, ctx.RequestAborted, authenticationNotBefore);
                     if (validated is null)
                     {
                         ClearTierToken(ctx, authTier);
@@ -597,17 +608,12 @@ public static class MicrosoftAuthEndpoints
                             email = validated.Email ?? validated.PreferredUsername,
                         }));
 
-                        // Persist identity + the rotating refresh_token to /home so the user
-                        // doesn't have to re-auth after a container restart. On non-base tier
-                        // callbacks Entra still returns a refresh_token (because we always
-                        // request offline_access), so this also keeps the persisted record's
-                        // GraphTier in sync as the user adds add-on consents incrementally.
-                        if (!string.IsNullOrEmpty(refreshToken))
+                        try
                         {
                             await persistentIdentity.SaveIdentityAsync(ctx, new IdentityRecord
                             {
                                 Oid = oid,
-                                TenantId = validated.TenantId ?? "",
+                                TenantId = validated.TenantId,
                                 UserId = newUserId,
                                 Name = validated.Name,
                                 Email = validated.Email ?? validated.PreferredUsername,
@@ -615,23 +621,11 @@ public static class MicrosoftAuthEndpoints
                                 GraphTier = ctx.Session.GetString("graph_tier"),
                             });
                         }
-                        else
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                         {
-                            // Edge case: re-consent without a fresh refresh_token. Update only
-                            // the GraphTier so post-restart hydration still reflects the new
-                            // add-on without clobbering the existing refresh token.
-                            await persistentIdentity.UpdateGraphTierAsync(oid, ctx.Session.GetString("graph_tier"));
-                            if (accountSwitched)
-                            {
-                                // SaveIdentityAsync (which rewrites the finops_id cookie) did not
-                                // run — the cookie still points at the PREVIOUS account's OID and
-                                // would resurrect that identity on the next hydration. Point it at
-                                // the new account when it has a persisted identity, else drop it.
-                                if (persistentIdentity.LoadByOid(oid) is not null)
-                                    persistentIdentity.SetIdentityCookie(ctx, oid);
-                                else
-                                    persistentIdentity.Clear(ctx, null);
-                            }
+                            logger.LogError(ex, "Could not persist identity during sign-in");
+                            ClearAuthChain(ctx);
+                            return Results.Redirect("/?azure_error=identity_unavailable");
                         }
 
                         var chainOwner = ctx.Session.GetString("auth_chain_oid");

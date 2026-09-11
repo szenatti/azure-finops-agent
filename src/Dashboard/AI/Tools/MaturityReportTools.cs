@@ -71,6 +71,8 @@ Only 'capabilities' is strictly required; every other section renders when prese
         [Description("Filename without extension. Default 'FinOps-Maturity-Assessment'.")] string? filename = null,
         [Description("Optional customer/tenant name (overrides reportJson.customer for chrome).")] string? customer = null)
     {
+        var owner = HttpHelper.CurrentTurnUserId();
+        if (!owner.HasValue) return Task.FromResult("Error: Artifact owner is unavailable.");
         if (string.IsNullOrWhiteSpace(reportJson))
             return Task.FromResult("Error: reportJson is required.");
 
@@ -96,7 +98,7 @@ Only 'capabilities' is strictly required; every other section renders when prese
         var outputPath = Path.Combine(Path.GetTempPath(), $"{fileId}_{safeName}.html");
         File.WriteAllText(outputPath, html, new UTF8Encoding(false));
 
-        HtmlPresentationTools.GeneratedFiles[fileId] = (outputPath, DateTime.UtcNow, HttpHelper.CurrentTurnUserId());
+        HtmlPresentationTools.GeneratedFiles[fileId] = (outputPath, DateTime.UtcNow, owner);
         activity?.SetTag("report.capabilities", capabilityCount);
 
         // slideCount slot doubles as the section/capability count shown on the card.

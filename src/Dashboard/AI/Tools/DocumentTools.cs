@@ -35,6 +35,8 @@ Pass the FULL document text in documentContent — the tool does not summarize o
         [Description("Document format: 'markdown' for .md, 'text' for .txt. Default: 'markdown'")] string? format,
         [Description("One-line description shown on the download card")] string? description)
     {
+        var owner = HttpHelper.CurrentTurnUserId();
+        if (!owner.HasValue) return Task.FromResult("Error: Artifact owner is unavailable.");
         if (string.IsNullOrWhiteSpace(documentContent))
             return Task.FromResult("Error: No document content provided.");
 
@@ -57,7 +59,7 @@ Pass the FULL document text in documentContent — the tool does not summarize o
 
         File.WriteAllText(outputPath, documentContent, new UTF8Encoding(false));
 
-        ScriptTools.GeneratedFiles[fileId] = (outputPath, DateTime.UtcNow, documentContent, HttpHelper.CurrentTurnUserId());
+        ScriptTools.GeneratedFiles[fileId] = (outputPath, DateTime.UtcNow, documentContent, owner);
 
         var lineCount = documentContent.Split('\n').Length;
 
