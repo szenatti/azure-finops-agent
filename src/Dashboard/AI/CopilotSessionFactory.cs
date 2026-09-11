@@ -56,6 +56,7 @@ Do NOT answer literally — for Crawl run `GetCrawlMaturityEvidence` exactly onc
 - Uploaded-file follow-ups: propose a single highest-leverage *action* on their data (cleanup script, ranked actions, deck) — NOT another analytical question. ≥3 files: prefer follow-ups that cut across files and produce a meeting-ready deliverable.
 - For repeatable checks (""script"", ""how do I run this myself""), call GenerateScript.
 - FILES ARE ONLY DELIVERED BY TOOLS. A file becomes downloadable ONLY via GenerateDocument (.md/.txt), GenerateScript (.sh/.ps1), GenerateHtmlPresentation or GenerateMaturityReport (.html) — the UI then renders a download card. Writing a file with bash/create_file/python delivers NOTHING to the user: the browser cannot reach the container filesystem.
+- GenerateDocument is ALWAYS loaded. You are FORBIDDEN from saying file generation is ""unavailable"", ""not enabled"", ""disabled"", or conditional on anything — there is no such setting. If the user asks for a file, call the tool in that same turn.
 - NEVER invent a download link. `sandbox:...`, `file:...`, `/home/...`, `/tmp/...`, `computer:///` and any absolute path are broken links, and container paths leak the user's identity directory — never print one. The only valid link is the download card the tool produces.
 - ""as a .md""|""markdown file""|""export this""|""send me a report""|""document for my team""|""write this up as a file"" → call GenerateDocument with the FULL text, then say the file is ready above/below — do not paste the whole document in chat as well.
 - Foundry/AOAI: use Microsoft.CognitiveServices APIs via QueryAzure. Per-region quota: `GET /subscriptions/{id}/providers/Microsoft.CognitiveServices/locations/{region}/usages?api-version=2026-07-01` (when bumping api-version, also update AzureQueryTools.cs and the .github/copilot-instructions.md summary line).
@@ -92,12 +93,12 @@ Escalation ladder (work in parallel where possible):
 3. **Public structured APIs** — prices.azure.com (try BOTH `serviceName='Azure OpenAI'` AND `'Foundry Models'`, no region, broad `productNameContains`), GitHub Marketplace, npm/NuGet/PyPI, vendor public pricing APIs.
 4. **FetchPublicWebPage on vendor's pricing page** — `azure.microsoft.com/en-us/pricing/details/...`, `github.com/pricing`, `datadoghq.com/pricing`, `aws.amazon.com/{svc}/pricing`, `cloud.google.com/{svc}/pricing`, vendor's own /pricing URL. Best-effort static-HTML scrape — most SaaS vendors publish list prices on a public page.
 5. **FetchPublicWebPage on authoritative docs** — `learn.microsoft.com`, AWS/GCP docs, vendor docs, `raw.githubusercontent.com/Azure/azure-rest-api-specs/...`.
-6. **Last-resort: Copilot CLI built-ins** (`bash`, `view`, `edit`, `create_file`, `grep`, `glob`). NO built-in web fetch — always prefer FetchPublicWebPage. If FetchPublicWebPage fails (timeout, JS-only page), fall back to `bash curl -sL <url> | head -c 200000`.
+6. **If registered tools cannot answer**, explain the remaining limitation or ask for a narrower scope or uploaded export. Shell execution, arbitrary code, filesystem access and built-in network tools are disabled. Never seek an alternate execution path or credentials.
 
 Hard rules:
 1. **One miss is not an answer.** Try ≥3 rungs before saying ""unavailable"".
 2. **Never repeat a blocker across turns.** If user pushes back (""again I said…"", ""find another way"", ""try harder"", ""use X"", ""why don't you answer""), you are FORBIDDEN from giving the same blocker — pick UNTRIED rungs and produce a real number or parameterised formula.
-3. **Pushback is uncapped budget.** Fan out to 6-10+ tool calls in parallel when the user pushes back. Output rules still apply (one chart or table); investigation budget does not.
+3. **Respect workload budgets.** User pushback never overrides resource limits, denied permissions, destination restrictions or retry hints. Reuse results and offer a narrower follow-up when the budget is exhausted.
 4. **Always answer — even partially.** If one input remains unknown (SKU's $/unit, etc.), still produce the answer with a parameterised formula and the known inputs. A 3-column table `Input | Known | Unknown (formula)` always beats ""I don't know"". Never refuse a what-if for a missing rate.
 5. **Always log sources.** When falling through ≥2 sources, append a one-line `Sources tried: ...` footer naming each source and outcome (e.g. `Sources tried: Cost Mgmt (family-level only), Retail API — Azure OpenAI / Foundry Models (no nano meter), Pricesheet (no entry), FetchPublicWebPage on aka.ms/aoai-pricing (a nano model: $0.10/1M prompt, $0.40/1M output).`).
 
@@ -122,7 +123,7 @@ Worked examples (same ladder applies to anything specific):
 
 ## Large Data Strategy
 1. **Scope at source** — aggregate (groupBy/summarize/$top/$select) in the query. Never raw ungrouped.
-2. **Python post-processing** for >100KB or pivots/joins — save JSON, run pandas.
+2. **Bounded post-processing** - use QueryUploadedFile for uploaded data; otherwise aggregate at the source or narrow the query. Do not save data to disk or execute Python or shell commands.
 3. **Drill-down** — high-level aggregate first, then targeted queries for top items.
 
 ## Commitment-Reconciled Right-Sizing (Advisor is blind to RIs)
@@ -322,22 +323,25 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
         try { Directory.CreateDirectory(CopilotHome); } catch { }
     }
 
-    // The Copilot CLI's `task` tool spawns a NESTED general-purpose agent that
-    // can loop for many minutes on a single call (App Insights showed one
-    // 8-minute Tool:task span inside a 12.7-minute chat turn). FinOps work
-    // never needs a sub-agent — the model has direct tools for everything —
-    // so exclude it from every session.
-    //
-    // Do NOT add the shell tools (bash / powershell / rg) here. They look like
-    // pure latency — the model uses them as a scratchpad and each call is a full
-    // model round-trip — but they are load-bearing for data-heavy answers.
-    // Measured on "10 cheapest regions for a D4s_v5": 37s with the shells
-    // available, 56s with `bash` excluded (the model just switched to
-    // powershell), and 126s with all three excluded, because it then had to sort
-    // ~100 pricing rows in-context. Sorting in a shell is much cheaper than
-    // reasoning over the rows. The fix for that query is to make the pricing
-    // tool return pre-sorted data, not to take the shells away.
-    private static readonly string[] ExcludedBuiltInTools = { "task" };
+    internal static ToolSet AllowedTools(IEnumerable<AIFunctionDeclaration> tools)
+    {
+        string[] blocked = ["bash", "powershell", "rg", "task", "view", "edit", "create"];
+        var allowed = new ToolSet().AddBuiltIn(BuiltInTools.Isolated.Except(blocked, StringComparer.OrdinalIgnoreCase));
+        foreach (var tool in tools)
+            allowed.AddCustom(tool.Name);
+        return allowed;
+    }
+
+    internal static Task<GitHub.Copilot.Rpc.PermissionDecision> DenyRuntimePermission(
+        PermissionRequest request, PermissionInvocation invocation) =>
+        Task.FromResult(GitHub.Copilot.Rpc.PermissionDecision.Reject(
+            "Host execution, filesystem and network permissions are disabled. Use the registered FinOps tools."));
+
+    internal static Task<GitHub.Copilot.Rpc.PermissionDecision> AuthorizeHostTool(
+        PermissionRequest request, PermissionInvocation invocation, IEnumerable<AIFunctionDeclaration> tools) =>
+        request is PermissionRequestCustomTool custom && tools.Any(tool => tool.Name == custom.ToolName)
+            ? Task.FromResult(GitHub.Copilot.Rpc.PermissionDecision.ApproveOnce())
+            : DenyRuntimePermission(request, invocation);
 
     private CopilotSessionFactory(
         AiTelemetry telemetry,
@@ -375,6 +379,7 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
         var otlpEndpoint = Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT");
         var clientOptions = new CopilotClientOptions
         {
+            Mode = CopilotClientMode.Empty,
             // Point the CLI's session-state directory at the persistent /home
             // Azure Files mount on App Service. Replaces the older HOME env var
             // hack — same effect, but explicit. Falls back to Path.GetTempPath()
@@ -447,13 +452,17 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
         // so carrying these schemas every turn is far cheaper than the round-trips.
         sharedTools.AddRange(RetailPricingTools.Create());
         sharedTools.AddRange(CostEstimateTools.Create());
+        // Deferred, this was undiscoverable: tool search did not match "compile
+        // the findings into a Markdown file" and the model invented a "file
+        // generation is not enabled" refusal instead. It is the only way to
+        // deliver a .md/.txt, and its schema is ~1.5K chars.
+        sharedTools.AddRange(DocumentTools.Create());
         // COLD PATH — defer=Auto: the CLI loads these on demand via tool search.
         // Cuts ~15-20K input tokens of tool schemas per round-trip (measured:
         // fresh "hi" carried 26K input tokens with everything always-on).
         sharedTools.AddRange(DeferredTool.WrapAll(HealthTools.Create()));
         sharedTools.AddRange(DeferredTool.WrapAll(HtmlPresentationTools.Create()));
         sharedTools.AddRange(DeferredTool.WrapAll(ScriptTools.Create()));
-        sharedTools.AddRange(DeferredTool.WrapAll(DocumentTools.Create()));
         sharedTools.AddRange(DeferredTool.WrapAll(MaturityReportTools.Create()));
         sharedTools.AddRange(DeferredTool.WrapAll(WebFetchTools.Create()));
 
@@ -832,14 +841,14 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
             ReasoningSummary = effort is null ? null : ReasoningSummary.Concise,
             Streaming = true,
             Tools = SessionBoundTool.Bind(GetOrCreateUserTools(userId), userId, sessionId),
-            ExcludedTools = ExcludedBuiltInTools,
+            AvailableTools = AllowedTools(GetOrCreateUserTools(userId)),
             // Explicitly pin tool-search deferral ON (SDK 1.0.7 formalized the
             // option; default may drift across SDK/CLI bumps). Our DeferredTool
             // wrapper marks cold-path tools defer=Auto — this keeps the CLI
             // honoring those markers so per-request input tokens stay ~50% down.
             ToolSearch = new ToolSearchConfig { Enabled = true },
             WorkingDirectory = GetWorkingDirectory(userId, entraOid),
-            OnPermissionRequest = PermissionHandler.ApproveAll,
+            OnPermissionRequest = (request, invocation) => AuthorizeHostTool(request, invocation, GetOrCreateUserTools(userId)),
             Provider = new ProviderConfig
             {
                 // Azure AI Foundry exposes an OpenAI-compatible endpoint at /openai/v1/.
@@ -885,11 +894,11 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
             ReasoningSummary = effort is null ? null : ReasoningSummary.Concise,
             Streaming = true,
             Tools = SessionBoundTool.Bind(GetOrCreateUserTools(userId), userId, sessionId),
-            ExcludedTools = ExcludedBuiltInTools,
+            AvailableTools = AllowedTools(GetOrCreateUserTools(userId)),
             // See CreateSessionConfigAsync — keep deferral pinned on for resumes too.
             ToolSearch = new ToolSearchConfig { Enabled = true },
             WorkingDirectory = GetWorkingDirectory(userId, entraOid),
-            OnPermissionRequest = PermissionHandler.ApproveAll,
+            OnPermissionRequest = (request, invocation) => AuthorizeHostTool(request, invocation, GetOrCreateUserTools(userId)),
             Provider = new ProviderConfig
             {
                 // Azure AI Foundry exposes an OpenAI-compatible endpoint at /openai/v1/.
