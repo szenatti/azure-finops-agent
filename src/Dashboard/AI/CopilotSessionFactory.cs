@@ -55,6 +55,9 @@ Do NOT answer literally — for Crawl run `GetCrawlMaturityEvidence` exactly onc
 - Uploaded-file inspection MUST use QueryUploadedFile only—never shell, PowerShell, Python, filesystem search, or a temp path. For XLSX sheet names, row counts, and numeric count/sum/min/max/mean summaries use `mode='workbook'` exactly once; do not call aggregate afterward when that summary already contains the answer. Other XLSX modes accept `{""sheet"":""SheetName""}`.
 - Uploaded-file follow-ups: propose a single highest-leverage *action* on their data (cleanup script, ranked actions, deck) — NOT another analytical question. ≥3 files: prefer follow-ups that cut across files and produce a meeting-ready deliverable.
 - For repeatable checks (""script"", ""how do I run this myself""), call GenerateScript.
+- FILES ARE ONLY DELIVERED BY TOOLS. A file becomes downloadable ONLY via GenerateDocument (.md/.txt), GenerateScript (.sh/.ps1), GenerateHtmlPresentation or GenerateMaturityReport (.html) — the UI then renders a download card. Writing a file with bash/create_file/python delivers NOTHING to the user: the browser cannot reach the container filesystem.
+- NEVER invent a download link. `sandbox:...`, `file:...`, `/home/...`, `/tmp/...`, `computer:///` and any absolute path are broken links, and container paths leak the user's identity directory — never print one. The only valid link is the download card the tool produces.
+- ""as a .md""|""markdown file""|""export this""|""send me a report""|""document for my team""|""write this up as a file"" → call GenerateDocument with the FULL text, then say the file is ready above/below — do not paste the whole document in chat as well.
 - Foundry/AOAI: use Microsoft.CognitiveServices APIs via QueryAzure. Per-region quota: `GET /subscriptions/{id}/providers/Microsoft.CognitiveServices/locations/{region}/usages?api-version=2026-07-01` (when bumping api-version, also update AzureQueryTools.cs and the .github/copilot-instructions.md summary line).
 
 ## Public Pricing Fast Path (overrides Persistence for ordinary list-price questions)
@@ -450,6 +453,7 @@ Each label ≤60 chars, each prompt ≤2 sentences, each must reference concrete
         sharedTools.AddRange(DeferredTool.WrapAll(HealthTools.Create()));
         sharedTools.AddRange(DeferredTool.WrapAll(HtmlPresentationTools.Create()));
         sharedTools.AddRange(DeferredTool.WrapAll(ScriptTools.Create()));
+        sharedTools.AddRange(DeferredTool.WrapAll(DocumentTools.Create()));
         sharedTools.AddRange(DeferredTool.WrapAll(MaturityReportTools.Create()));
         sharedTools.AddRange(DeferredTool.WrapAll(WebFetchTools.Create()));
 

@@ -1135,11 +1135,7 @@
                         }}</span>
                         <span class="script-meta"
                           >{{ msg.script.lineCount }} lines &middot;
-                          {{
-                            msg.script.language === "powershell"
-                              ? "PowerShell"
-                              : "Bash"
-                          }}</span
+                          {{ artifactLangLabel(msg.script.language) }}</span
                         >
                       </div>
                       <div class="script-header-actions">
@@ -1221,7 +1217,7 @@
                         <span
                           v-else
                           class="artifact-expired"
-                          title="Generated files are kept for 30 minutes — ask the agent to regenerate the script"
+                          title="Generated files are kept for 30 minutes — ask the agent to regenerate the file"
                           >Expired — ask to regenerate</span
                         >
                       </div>
@@ -1237,7 +1233,12 @@
                       class="script-toggle-btn"
                       @click="msg.script.expanded = !msg.script.expanded"
                     >
-                      {{ msg.script.expanded ? "Hide script" : "View script" }}
+                      {{ msg.script.expanded ? "Hide" : "View" }}
+                      {{
+                        isDocumentArtifact(msg.script.language)
+                          ? "document"
+                          : "script"
+                      }}
                     </button>
                     <pre
                       v-if="msg.script.expanded"
@@ -1395,11 +1396,7 @@
                 <span class="script-filename">{{ scriptReady.fileName }}</span>
                 <span class="script-meta"
                   >{{ scriptReady.lineCount }} lines &middot;
-                  {{
-                    scriptReady.language === "powershell"
-                      ? "PowerShell"
-                      : "Bash"
-                  }}</span
+                  {{ artifactLangLabel(scriptReady.language) }}</span
                 >
               </div>
               <div class="script-header-actions">
@@ -5321,6 +5318,11 @@ function friendlyToolLabel(tc) {
     if (lang.includes("bash") || lang.includes("sh")) return "Bash";
     return "Script";
   }
+  if (tool === "GenerateDocument") {
+    const fmt = (args?.format || "").toLowerCase();
+    if (fmt.includes("text") || fmt.includes("txt")) return "Doc · txt";
+    return "Doc · md";
+  }
   if (tool === "RenderChart" || tool === "RenderAdvancedChart") {
     const t = (args?.type || args?.chartType || "").toLowerCase();
     if (t.includes("bar")) return "Chart · bar";
@@ -7243,6 +7245,22 @@ function requestScript() {
   input.value =
     "Based on our conversation, generate an Azure CLI script to implement the FinOps recommendations we discussed. Ask me to confirm the specific actions before generating the script. If there are no actionable recommendations yet, let me know.";
   send();
+}
+
+// GenerateDocument reuses the script artifact pipeline, so the same card renders
+// .md/.txt documents — only the wording differs.
+const ARTIFACT_LANGUAGES = {
+  powershell: "PowerShell",
+  bash: "Bash",
+  markdown: "Markdown",
+  text: "Text",
+};
+function artifactLangLabel(language) {
+  return ARTIFACT_LANGUAGES[String(language || "").toLowerCase()] || "Bash";
+}
+function isDocumentArtifact(language) {
+  const lang = String(language || "").toLowerCase();
+  return lang === "markdown" || lang === "text";
 }
 
 // Transient "Copied!" feedback on the script copy buttons — keyed by fileId

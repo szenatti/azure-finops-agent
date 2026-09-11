@@ -917,6 +917,37 @@ Check(!deckHtml.Contains("cdn.jsdelivr.net", StringComparison.Ordinal)
     && deckHtml.Contains("Released under the MIT License", StringComparison.Ordinal),
     "Chart.js is inlined with its licence banner, so a downloaded deck renders offline");
 
+{
+    const string documentBody = "# Discovery\n\n| Item | Value |\n| --- | --- |\n| Scope | 2 subs |\n";
+    var documentResult = await Invoke(
+        DocumentTools.Create().Single(tool => tool.Name == "GenerateDocument"),
+        new AIFunctionArguments
+        {
+            ["documentContent"] = documentBody,
+            // A caller-supplied extension and a colon in the description must not
+            // corrupt the single colon-delimited marker line the SSE handler parses.
+            ["filename"] = "discovery-report.md",
+            ["format"] = "markdown",
+            ["description"] = "Migration discovery: landing zone",
+        });
+
+    Check(documentResult.StartsWith("__SCRIPT_READY__:", StringComparison.Ordinal)
+        && !documentResult.Contains('\n'),
+        "Document generation reuses the one-line script-ready marker");
+
+    var documentParts = documentResult["__SCRIPT_READY__:".Length..].Split(':', 5);
+    Check(documentParts.Length == 5
+        && documentParts[1] == "discovery-report.md"
+        && documentParts[3] == "markdown",
+        "The marker carries a single .md extension and the markdown language slot");
+
+    var documentEntry = ScriptTools.GeneratedFiles[documentParts[0]];
+    Check(File.ReadAllText(documentEntry.Path) == documentBody && documentEntry.Content == documentBody,
+        "The document is written verbatim and registered for owner-checked download");
+    File.Delete(documentEntry.Path);
+    ScriptTools.GeneratedFiles.TryRemove(documentParts[0], out _);
+}
+
 Console.WriteLine("All large-tenant regression checks passed.");
 
 static void Check(bool condition, string name)

@@ -152,6 +152,8 @@ Use `GetCrawlMaturityEvidence` exactly once for explicit Crawl scoring.
 
 - One response contains one chart or one table, not both.
 - Generated script/deck markers are converted into structured SSE events.
+- A file is downloadable only when an artifact tool registers it: `GenerateScript` and `GenerateDocument` (`__SCRIPT_READY__`), `GenerateHtmlPresentation` and `GenerateMaturityReport` (`__HTML_READY__`). Files written by the shell built-ins are unreachable, and `sandbox:`/`file:`/absolute-path links are always broken and leak the per-user working directory. Keep this stated in the system prompt.
+- `GenerateDocument` reuses `ScriptTools.GeneratedFiles`, the script marker and `/api/download/script/{id}`, so ownership, replay, expiry and cleanup are shared. Its marker is one colon-delimited line: filenames are sanitized and descriptions stripped of newlines and colons so the SSE parser cannot be corrupted.
 - Download endpoints require an authenticated session and owner match.
 - Expired artifacts render an expired state rather than a dead link.
 - Chart.js 4.4.0 is vendored at `src/Dashboard/AI/Tools/Assets/chart.umd.min.js` (MIT, banner retained) and embedded in the assembly, so a downloaded deck renders offline. Keep it inlined, keep the licence banner, and update the pinned version in one place. Google Fonts stays remote and degrades to a system font.

@@ -63,7 +63,13 @@ public static class DownloadEndpoints
             var fileName = Path.GetFileName(entry.Path);
             var downloadName = fileName.Contains('_') ? fileName[(fileName.IndexOf('_') + 1)..] : fileName;
             var bytes = File.ReadAllBytes(entry.Path);
-            var contentType = downloadName.EndsWith(".ps1") ? "application/x-powershell" : "application/x-shellscript";
+            var contentType = Path.GetExtension(downloadName).ToLowerInvariant() switch
+            {
+                ".ps1" => "application/x-powershell",
+                ".md" => "text/markdown; charset=utf-8",
+                ".txt" => "text/plain; charset=utf-8",
+                _ => "application/x-shellscript",
+            };
 
             return Results.File(bytes, contentType, downloadName);
         });
