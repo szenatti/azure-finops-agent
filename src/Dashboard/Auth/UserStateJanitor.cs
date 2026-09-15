@@ -17,7 +17,10 @@ public sealed class UserStateJanitor : BackgroundService
 
     private static readonly TimeSpan IdleThreshold = TimeSpan.FromHours(1);
     private static readonly TimeSpan SweepInterval = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan PersistedSessionTtl = TimeSpan.FromDays(30);
+    // Every session listing enumerates this directory over the /home SMB mount,
+    // where a file operation costs ~22 ms against ~0.2 ms on local disk, so the
+    // retained session count is a direct latency tax on every sidebar refresh.
+    private static readonly TimeSpan PersistedSessionTtl = TimeSpan.FromDays(14);
     private static readonly TimeSpan TtlSweepInterval = TimeSpan.FromHours(6);
 
     private readonly AiTelemetry _telemetry;

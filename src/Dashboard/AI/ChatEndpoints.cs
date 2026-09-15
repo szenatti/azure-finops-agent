@@ -23,9 +23,30 @@ public static class ChatEndpoints
     // is released only after SDK idle/error or a confirmed abort.
     private static readonly ConcurrentDictionary<string, ActiveTurnState> ActiveTurns = new();
 
-    /// <summary>Upper bound on a single turn, shared by the chat wait and the
-    /// scheduler. The frontend's recovery poller is sized to the same budget.</summary>
-    internal static readonly TimeSpan MaxTurnDuration = TimeSpan.FromMinutes(15);
+    /// <summary>Primary reclaim rule: a turn is abandoned only after this long with
+    /// NO SDK event. A total-duration cap cannot be used — an observed turn sat
+    /// silent for 14 minutes, resumed, and was killed 0.5 s after a tool completed
+    /// while it was actively working. Long silent gaps are normal here: the CLI owns
+    /// the model round-trip, so provider-side retry/backoff and high-effort
+    /// deliberation on a large accumulated context emit nothing at all.</summary>
+    internal static readonly TimeSpan MaxTurnSilence = TimeSpan.FromMinutes(15);
+
+    /// <summary>Hard ceiling so a turn that keeps emitting events can never hold the
+    /// session's turn gate indefinitely. Deliberately far above the silence rule,
+    /// which is what actually reclaims dead turns. Chat only — the scheduler applies
+    /// its own shorter RunTimeout.</summary>
+    internal static readonly TimeSpan MaxTurnDuration = TimeSpan.FromMinutes(60);
+
+    // Global admission control. The per-session gate above bounds ONE user; nothing
+    // bounded the box. Every turn holds a CLI session, a model stream and a share of
+    // the tenant TPM budget, so unbounded concurrency degrades every in-flight turn at
+    // once and bursts past the deployment's token-per-minute limit.
+    private const int DefaultMaxConcurrentTurns = 6;
+    private static int _maxConcurrentTurns = DefaultMaxConcurrentTurns;
+    private static SemaphoreSlim _turnAdmission = new(DefaultMaxConcurrentTurns, DefaultMaxConcurrentTurns);
+    // Short queue so a burst waits rather than failing, but a caller never blocks
+    // behind turns that can legitimately run for minutes.
+    private static readonly TimeSpan TurnAdmissionWait = TimeSpan.FromSeconds(20);
 
     private sealed class ActiveTurnState(long userId, CopilotSession? session)
     {
@@ -123,8 +144,12 @@ public static class ChatEndpoints
         CopilotSessionFactory copilotFactory,
         SessionTokenStore tokenStore,
         AiTelemetry telemetry,
-        ILogger logger)
+        ILogger logger,
+        int maxConcurrentTurns = DefaultMaxConcurrentTurns)
     {
+        _maxConcurrentTurns = Math.Max(1, maxConcurrentTurns);
+        _turnAdmission = new SemaphoreSlim(_maxConcurrentTurns, _maxConcurrentTurns);
+
         app.MapPost("/api/chat", async (HttpContext ctx, IHttpClientFactory httpFactory) =>
         {
             var userJson = ctx.Session.GetString("user");
@@ -371,8 +396,24 @@ public static class ChatEndpoints
                 retryReporter.Dispose();
             });
             ActiveTurnState? turnState = null;
+            // Set only once the admission permit is actually held, so the finally can
+            // never release a permit this request never took.
+            var admitted = false;
             try
             {
+                // Not cancellation-linked: the wait is short, and a turn deliberately
+                // survives client disconnect, so a dropped browser must not abandon it.
+                admitted = await _turnAdmission.WaitAsync(TurnAdmissionWait);
+                if (!admitted)
+                {
+                    logger.LogInformation("Rejected turn for {User}: {Max} concurrent turns already running", userLogin, _maxConcurrentTurns);
+                    chatActivity?.SetTag("ai.admission_rejected", true);
+                    await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(new { type = "busy", message = "The service is busy with other requests right now — this message wasn't sent. Please try again in a moment." })}\n\n");
+                    await ctx.Response.WriteAsync("data: [DONE]\n\n");
+                    await ctx.Response.Body.FlushAsync();
+                    return;
+                }
+
                 CopilotSession session;
                 var sessionSw = Stopwatch.StartNew();
                 string sessionAcquireMode;
@@ -494,6 +535,10 @@ public static class ChatEndpoints
                 var done = new TaskCompletionSource();
                 var toolTracker = new ConcurrentDictionary<string, (string Name, DateTimeOffset StartTime, Activity? Activity)>();
                 var firstEventLogged = 0;
+                // Liveness clock for the silence watchdog below, bumped by every
+                // SDK event. Send time seeds it so a session that never responds
+                // at all is still caught.
+                var lastEventTicks = DateTime.UtcNow.Ticks;
 
                 // Browser disconnect releases this SSE handler but does NOT
                 // abort the running turn. The Copilot CLI keeps generating
@@ -550,6 +595,7 @@ public static class ChatEndpoints
                 {
                     var mainSub = s.On(async (SessionEvent evt) =>
                     {
+                        Volatile.Write(ref lastEventTicks, DateTime.UtcNow.Ticks);
                         if (System.Threading.Interlocked.Exchange(ref firstEventLogged, 1) == 0)
                         {
                             try
@@ -703,14 +749,60 @@ public static class ChatEndpoints
                         AzureFinOps.Dashboard.AI.Tools.UploadedFileTools.RemoveForUser(userId, img.FileId);
                 }
 
-                // The SDK signals completion via SessionIdle/SessionError. If it
-                // dies without either, an unbounded wait would hold the session's
-                // turn gate for the process lifetime, so cap it at the backend's
-                // turn budget and treat the timeout as an abandoned turn.
-                if (await Task.WhenAny(done.Task, Task.Delay(MaxTurnDuration)) != done.Task)
+                // The SDK signals completion via SessionIdle/SessionError. If it dies
+                // without either, an unbounded wait would hold the session's turn gate
+                // for the process lifetime. Reclaim on SILENCE rather than elapsed
+                // time: a turn still emitting tool/delta events is making progress and
+                // must never be killed mid-flight, however long it has been running.
+                // MaxTurnDuration is only a ceiling on a turn that never stops.
+                var turnCeiling = DateTime.UtcNow + MaxTurnDuration;
+                string? abandonReason = null;
+                while (true)
                 {
-                    logger.LogWarning("Turn for session {SessionId} exceeded {Minutes} min without an SDK completion event; abandoning it",
-                        activeSessionId, MaxTurnDuration.TotalMinutes);
+                    var now = DateTime.UtcNow;
+                    var silence = now - new DateTime(Volatile.Read(ref lastEventTicks), DateTimeKind.Utc);
+                    var untilSilent = MaxTurnSilence - silence;
+                    var untilCeiling = turnCeiling - now;
+                    if (untilSilent <= TimeSpan.Zero)
+                    {
+                        abandonReason = $"emitted no SDK event for {silence.TotalMinutes:N0} min";
+                        break;
+                    }
+                    if (untilCeiling <= TimeSpan.Zero)
+                    {
+                        abandonReason = $"exceeded the {MaxTurnDuration.TotalMinutes:N0} min ceiling while still emitting events";
+                        break;
+                    }
+                    var wait = untilSilent < untilCeiling ? untilSilent : untilCeiling;
+                    if (await Task.WhenAny(done.Task, Task.Delay(wait)) == done.Task) break;
+                }
+
+                if (abandonReason is not null)
+                {
+                    logger.LogWarning("Turn for session {SessionId} {Reason} without a completion event; abandoning it and discarding the live session",
+                        activeSessionId, abandonReason);
+                    chatActivity?.SetTag("ai.turn_abandoned", abandonReason);
+                    // Reached only after a full silence window, so the handle is dead
+                    // rather than slow. It stays cached in LiveSessions, where the next
+                    // turn would resume it in ~0 ms and inherit the same dead process.
+                    // Drop it — on-disk history is untouched, so the next turn gets a
+                    // fresh CLI process with the conversation intact. Mirrors what the
+                    // SessionError path already does for a session the SDK reported dead.
+                    if (telemetry.LiveSessions.TryRemove(activeSessionId, out var wedged))
+                    {
+                        telemetry.ActiveSessions.Add(-1);
+                        try { await wedged.Session.DisposeAsync(); } catch { }
+                    }
+                    // Close the stream honestly for a still-connected client. Without a
+                    // terminal event it just goes quiet and the client falls into its
+                    // full 15-minute persisted-transcript recovery poll for an answer
+                    // that will never land.
+                    await SafeEmit(JsonSerializer.Serialize(new
+                    {
+                        type = "error",
+                        message = "This response stopped unexpectedly and has been ended. Your conversation is saved — send the question again to retry."
+                    }));
+                    await SafeEmit("[DONE]");
                     done.TrySetResult();
                 }
 
@@ -855,6 +947,7 @@ public static class ChatEndpoints
                 // Also releases a state orphaned by a failed MoveTurn, so a
                 // waiting Stop resolves instead of timing out.
                 turnState?.Completion.TrySetResult();
+                if (admitted) _turnAdmission.Release();
             }
         });
 

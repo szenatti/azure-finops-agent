@@ -428,7 +428,8 @@ var idTokenValidator = app.Services.GetRequiredService<IdTokenValidator>();
 
 app.MapMicrosoftAuthEndpoints(oauthOptions, entraCredentials, idTokenValidator, telemetry, persistentIdentity, logger);
 app.MapAzureSessionEndpoints(tokenStore, telemetry, persistentIdentity, logger);
-app.MapChatEndpoints(copilotFactory, tokenStore, telemetry, logger);
+app.MapChatEndpoints(copilotFactory, tokenStore, telemetry, logger,
+    app.Configuration.GetValue("Chat:MaxConcurrentTurns", 6));
 app.MapSessionEndpoints(copilotFactory, telemetry, jobStore, logger);
 AzureFinOps.Dashboard.Jobs.JobEndpoints.MapJobEndpoints(app, jobStore, jobScheduler, logger);
 app.MapMetaEndpoints(appInsightsCs ?? "", azureOpenAIDeployment);
